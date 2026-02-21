@@ -1,0 +1,109 @@
+# ============================================================================
+# Enterprise Cloud Transformation Platform (ECTP) - Python Dependencies
+# Author: Gopi Krishna Vajrala
+# ============================================================================
+
+# --- Web Framework ---
+# FastAPI: High-performance async web framework with automatic OpenAPI docs
+# Why: Fastest Python framework, built-in validation, auto-documentation
+fastapi==0.115.0
+
+# Uvicorn: ASGI server for running FastAPI applications
+# Why: Production-grade async server, supports HTTP/2, works with gunicorn
+uvicorn[standard]==0.32.0
+
+# --- AWS Integration ---
+# Boto3: Official AWS SDK for Python
+# Why: Required for all AWS service interactions (EC2, S3, RDS, etc.)
+boto3==1.35.0
+
+# --- Database ---
+# SQLAlchemy: Python SQL toolkit and ORM
+# Why: Enterprise-standard ORM, supports async, connection pooling
+sqlalchemy[asyncio]==2.0.35
+
+# asyncpg: Fast PostgreSQL driver for async Python
+# Why: High-performance async PostgreSQL driver for SQLAlchemy async
+asyncpg==0.30.0
+
+# alembic: Database migration tool for SQLAlchemy
+# Why: Manages database schema versions across environments
+alembic==1.14.0
+
+# --- Validation & Serialization ---
+# Pydantic: Data validation using Python type annotations
+# Why: FastAPI's native validation, settings management, schema generation
+pydantic==2.10.0
+pydantic-settings==2.6.0
+
+# --- HTTP Client ---
+# httpx: Async HTTP client for Python
+# Why: Async support, connection pooling, timeout handling for API calls
+httpx==0.28.0
+
+# --- Security ---
+# python-jose: JOSE (JWT) implementation for Python
+# Why: JWT token creation/verification for API authentication
+python-jose[cryptography]==3.3.0
+
+# passlib: Password hashing library
+# Why: Secure password hashing with bcrypt for user authentication
+passlib[bcrypt]==1.7.4
+
+# --- Caching ---
+# redis: Python Redis client
+# Why: Session management, caching, distributed locking
+redis[hiredis]==5.2.0
+
+# --- Logging & Monitoring ---
+# structlog: Structured logging for Python
+# Why: JSON-structured logs, context binding, processor pipeline
+structlog==24.4.0
+
+# python-json-logger: JSON formatted logging
+# Why: CloudWatch-compatible JSON log format
+python-json-logger==2.0.7
+
+# --- Task Queue ---
+# celery: Distributed task queue
+# Why: Background job processing, scheduled tasks, retry logic
+celery[redis]==5.4.0
+
+# --- Configuration ---
+# python-dotenv: Read .env files
+# Why: Environment-specific configuration without code changes
+python-dotenv==1.0.1
+
+# --- Utilities ---
+# tenacity: Retry library for Python
+# Why: Configurable retry logic for external API calls
+tenacity==9.0.0
+
+# PyYAML: YAML parser
+# Why: Configuration file parsing
+PyYAML==6.0.2
+
+# Jinja2: Template engine
+# Why: Email templates, report generation
+Jinja2==3.1.4
+
+# --- Date/Time ---
+# python-dateutil: Extensions to the datetime module
+# Why: Robust date parsing for API responses
+python-dateutil==2.9.0
+
+# --- Testing (dev dependencies) ---
+# pytest: Testing framework
+pytest==8.3.0
+pytest-asyncio==0.24.0
+pytest-cov==6.0.0
+pytest-mock==3.14.0
+
+# httpx for test client
+# (already included above)
+
+# --- Code Quality (dev dependencies) ---
+black==24.10.0
+flake8==7.1.0
+mypy==1.13.0
+isort==5.13.0

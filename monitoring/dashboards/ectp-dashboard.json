@@ -1,0 +1,139 @@
+{
+    "_comment": "Enterprise Cloud Transformation Platform (ECTP) - CloudWatch Dashboard. Author: Gopi Krishna Vajrala",
+    "widgets": [
+        {
+            "type": "text",
+            "properties": {
+                "markdown": "# ECTP Platform Dashboard\n**Enterprise Cloud Transformation Platform**\nAuthor: Gopi Krishna Vajrala"
+            },
+            "width": 24,
+            "height": 2
+        },
+        {
+            "type": "metric",
+            "properties": {
+                "title": "API Request Count",
+                "metrics": [
+                    ["ECTP", "RequestCount", "Service", "API", {"stat": "Sum", "period": 300}]
+                ],
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "period": 300
+            },
+            "width": 8,
+            "height": 6
+        },
+        {
+            "type": "metric",
+            "properties": {
+                "title": "API Latency (p99)",
+                "metrics": [
+                    ["ECTP", "Latency", "Service", "API", {"stat": "p99", "period": 300}]
+                ],
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "period": 300
+            },
+            "width": 8,
+            "height": 6
+        },
+        {
+            "type": "metric",
+            "properties": {
+                "title": "Error Rate",
+                "metrics": [
+                    ["ECTP", "ErrorCount", "Service", "API", {"stat": "Sum", "period": 300}]
+                ],
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "period": 300
+            },
+            "width": 8,
+            "height": 6
+        },
+        {
+            "type": "metric",
+            "properties": {
+                "title": "Database CPU Utilization",
+                "metrics": [
+                    ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "ectp-prod", {"stat": "Average", "period": 300}]
+                ],
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "period": 300
+            },
+            "width": 8,
+            "height": 6
+        },
+        {
+            "type": "metric",
+            "properties": {
+                "title": "Database Connections",
+                "metrics": [
+                    ["AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier", "ectp-prod", {"stat": "Average", "period": 300}]
+                ],
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "period": 300
+            },
+            "width": 8,
+            "height": 6
+        },
+        {
+            "type": "metric",
+            "properties": {
+                "title": "Redis Cache Hit Rate",
+                "metrics": [
+                    ["AWS/ElastiCache", "CacheHitRate", "CacheClusterId", "ectp-prod", {"stat": "Average", "period": 300}]
+                ],
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "period": 300
+            },
+            "width": 8,
+            "height": 6
+        },
+        {
+            "type": "metric",
+            "properties": {
+                "title": "ECS Task Count",
+                "metrics": [
+                    ["AWS/ECS", "RunningTaskCount", "ClusterName", "ectp-prod", {"stat": "Average", "period": 300}]
+                ],
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "period": 300
+            },
+            "width": 8,
+            "height": 6
+        },
+        {
+            "type": "metric",
+            "properties": {
+                "title": "SQS Queue Depth",
+                "metrics": [
+                    ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "ectp-tasks", {"stat": "Average", "period": 300}]
+                ],
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "period": 300
+            },
+            "width": 8,
+            "height": 6
+        },
+        {
+            "type": "metric",
+            "properties": {
+                "title": "Monthly Cost Trend",
+                "metrics": [
+                    ["ECTP", "MonthlyCost", "Account", "Production", {"stat": "Maximum", "period": 86400}]
+                ],
+                "view": "timeSeries",
+                "region": "us-east-1",
+                "period": 86400
+            },
+            "width": 8,
+            "height": 6
+        }
+    ]
+}

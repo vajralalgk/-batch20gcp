@@ -1,0 +1,423 @@
+# =============================================================================
+# Enterprise Cloud Transformation Platform (ECTP) - Kubernetes Deployment Manifest
+# =============================================================================
+# Author: Gopi Krishna Vajrala
+# Description: Kubernetes Deployment manifest for the ECTP FastAPI API service.
+#              Defines the desired state for running the ECTP application pods
+#              including replica count, container configuration, health checks,
+#              resource limits, security context, and rolling update strategy.
+#              This is the base configuration intended to be customized per
+#              environment using Kustomize overlays.
+#
+# Apply: kubectl apply -f deployment.yaml
+# Or via Kustomize: kubectl apply -k deployment/kubernetes/base/
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# apiVersion: Specifies the Kubernetes API version for this resource.
+# apps/v1 is the stable API group for Deployment resources.
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+
+# ---------------------------------------------------------------------------
+# kind: The type of Kubernetes resource being defined.
+# A Deployment manages a set of identical pods, ensuring the desired number
+# are running and handling rolling updates for zero-downtime deployments.
+# ---------------------------------------------------------------------------
+kind: Deployment
+
+# ---------------------------------------------------------------------------
+# metadata: Information that uniquely identifies this Deployment resource
+# within the Kubernetes cluster. Labels enable querying and grouping.
+# ---------------------------------------------------------------------------
+metadata:
+  # Name of the Deployment resource, used for kubectl commands and references
+  name: ectp-api
+  # Namespace where this Deployment will be created
+  # Using a dedicated namespace provides resource isolation and access control
+  namespace: ectp
+  # Labels applied to the Deployment resource itself (not the pods)
+  # Labels are key-value pairs used for organizing and selecting resources
+  labels:
+    # Application name label following Kubernetes recommended label conventions
+    app.kubernetes.io/name: ectp-api
+    # Component label identifying this as the API component of ECTP
+    app.kubernetes.io/component: api
+    # Part-of label indicating this belongs to the ECTP platform
+    app.kubernetes.io/part-of: ectp
+    # Managed-by label indicating this is managed by Kustomize
+    app.kubernetes.io/managed-by: kustomize
+    # Version label (overridden per environment by Kustomize overlays)
+    app.kubernetes.io/version: "latest"
+  # Annotations provide non-identifying metadata for tools and operators
+  annotations:
+    # Description annotation for documentation purposes
+    app.kubernetes.io/description: "ECTP FastAPI application deployment"
+    # Team responsible for this deployment
+    team: "ectp-platform"
+    # Contact information for the owning team
+    contact: "ectp-platform@example.com"
+
+# ---------------------------------------------------------------------------
+# spec: The desired state specification for the Deployment.
+# Kubernetes continuously works to ensure the actual state matches this spec.
+# ---------------------------------------------------------------------------
+spec:
+  # ---------------------------------------------------------------------------
+  # replicas: Number of pod instances to maintain.
+  # This is the base value; Kustomize overlays adjust per environment:
+  #   dev: 2, qa: 2, uat: 3, prod: 5 (or managed by HPA)
+  # ---------------------------------------------------------------------------
+  replicas: 3
+
+  # ---------------------------------------------------------------------------
+  # revisionHistoryLimit: Number of old ReplicaSets to retain for rollback.
+  # Keeping 10 revisions allows rolling back to any of the last 10 deployments.
+  # ---------------------------------------------------------------------------
+  revisionHistoryLimit: 10
+
+  # ---------------------------------------------------------------------------
+  # selector: Defines how the Deployment identifies which Pods it manages.
+  # The matchLabels must correspond to the labels in the pod template below.
+  # ---------------------------------------------------------------------------
+  selector:
+    # matchLabels: Pods with ALL of these labels are managed by this Deployment
+    matchLabels:
+      # Select pods with the ectp-api application name label
+      app.kubernetes.io/name: ectp-api
+      # Select pods with the api component label
+      app.kubernetes.io/component: api
+
+  # ---------------------------------------------------------------------------
+  # strategy: Defines how updates to the Deployment are rolled out.
+  # RollingUpdate ensures zero-downtime by gradually replacing old pods with new ones.
+  # ---------------------------------------------------------------------------
+  strategy:
+    # RollingUpdate strategy replaces pods incrementally rather than all at once
+    type: RollingUpdate
+    rollingUpdate:
+      # maxSurge: Maximum number of pods that can be created above the desired count.
+      # 25% means during an update, up to 25% extra pods can be running temporarily.
+      # This provides capacity during the transition from old to new versions.
+      maxSurge: "25%"
+      # maxUnavailable: Maximum number of pods that can be unavailable during the update.
+      # 0 means all existing pods must stay running until new ones are ready.
+      # This ensures no capacity loss during deployments (strictest zero-downtime).
+      maxUnavailable: 0
+
+  # ---------------------------------------------------------------------------
+  # template: The Pod template that defines what each replica looks like.
+  # Every pod created by this Deployment uses this template.
+  # ---------------------------------------------------------------------------
+  template:
+    # Pod metadata: Labels and annotations applied to each pod instance
+    metadata:
+      # Labels applied to each pod (must include the selector matchLabels)
+      labels:
+        # Application name label (MUST match selector.matchLabels)
+        app.kubernetes.io/name: ectp-api
+        # Component label (MUST match selector.matchLabels)
+        app.kubernetes.io/component: api
+        # Part-of label for grouping in dashboards and queries
+        app.kubernetes.io/part-of: ectp
+      # Pod annotations for monitoring, service mesh, and tooling integration
+      annotations:
+        # Prometheus scraping configuration: Enable metric collection
+        prometheus.io/scrape: "true"
+        # Prometheus port: The port where the /metrics endpoint is exposed
+        prometheus.io/port: "8000"
+        # Prometheus path: The URL path for the metrics endpoint
+        prometheus.io/path: "/metrics"
+        # Istio sidecar injection: Enable if using Istio service mesh
+        sidecar.istio.io/inject: "true"
+
+    # Pod specification: Defines the containers, volumes, and pod-level settings
+    spec:
+      # ---------------------------------------------------------------------------
+      # serviceAccountName: The Kubernetes ServiceAccount this pod runs as.
+      # ServiceAccounts provide identity for pods and can be bound to RBAC roles
+      # for controlling access to Kubernetes API resources and AWS services via IRSA.
+      # ---------------------------------------------------------------------------
+      serviceAccountName: ectp-api-sa
+
+      # ---------------------------------------------------------------------------
+      # securityContext: Pod-level security settings applied to all containers.
+      # These enforce security best practices to minimize the attack surface.
+      # ---------------------------------------------------------------------------
+      securityContext:
+        # runAsNonRoot: Require all containers to run as non-root users.
+        # The container will fail to start if the image runs as root (UID 0).
+        runAsNonRoot: true
+        # runAsUser: The UID to run the container process as.
+        # 1001 matches the 'ectp' user created in the Dockerfile.
+        runAsUser: 1001
+        # runAsGroup: The primary GID for the container process.
+        # 1001 matches the 'ectp' group created in the Dockerfile.
+        runAsGroup: 1001
+        # fsGroup: The GID applied to all files created by the pod.
+        # This ensures volume-mounted files are accessible by the pod's group.
+        fsGroup: 1001
+        # seccompProfile: Apply the default seccomp profile to restrict system calls.
+        # RuntimeDefault uses the container runtime's built-in seccomp profile
+        # which blocks dangerous syscalls while allowing normal operation.
+        seccompProfile:
+          type: RuntimeDefault
+
+      # ---------------------------------------------------------------------------
+      # terminationGracePeriodSeconds: Time to wait for graceful shutdown.
+      # When a pod is terminated, Kubernetes sends SIGTERM and waits this long
+      # before sending SIGKILL. 60 seconds gives the app time to finish requests.
+      # ---------------------------------------------------------------------------
+      terminationGracePeriodSeconds: 60
+
+      # ---------------------------------------------------------------------------
+      # topologySpreadConstraints: Distribute pods across failure domains.
+      # This ensures high availability by spreading replicas across nodes and zones.
+      # ---------------------------------------------------------------------------
+      topologySpreadConstraints:
+        # Spread pods across availability zones for zone-level fault tolerance
+        - maxSkew: 1
+          # maxSkew: Maximum difference in pod count between zones (1 = balanced)
+          topologyKey: topology.kubernetes.io/zone
+          # topologyKey: The node label used to identify zones
+          whenUnsatisfiable: DoNotSchedule
+          # whenUnsatisfiable: Don't schedule pods if they can't be balanced across zones
+          labelSelector:
+            matchLabels:
+              # Select pods belonging to this deployment for spread calculation
+              app.kubernetes.io/name: ectp-api
+
+      # ---------------------------------------------------------------------------
+      # containers: The list of containers to run in each pod.
+      # ECTP uses a single container per pod (FastAPI application).
+      # ---------------------------------------------------------------------------
+      containers:
+        # Primary application container: ECTP FastAPI API
+        - name: ectp-api
+          # Container image: ECR registry, repository, and tag
+          # The tag is overridden per environment by Kustomize or CI/CD
+          image: ectp-api:latest
+          # imagePullPolicy: Always pull the image to ensure the latest version is used
+          # Use 'IfNotPresent' for tagged versions to avoid unnecessary pulls
+          imagePullPolicy: Always
+
+          # -------------------------------------------------------------------
+          # ports: Container ports exposed to the pod network
+          # -------------------------------------------------------------------
+          ports:
+            # HTTP port for the FastAPI application
+            - name: http
+              # The port number the application listens on inside the container
+              containerPort: 8000
+              # Protocol used by the application (TCP is the default)
+              protocol: TCP
+
+          # -------------------------------------------------------------------
+          # env: Environment variables injected into the container.
+          # Sensitive values use secretKeyRef; non-sensitive use configMapKeyRef.
+          # -------------------------------------------------------------------
+          env:
+            # Environment identifier (dev/qa/uat/prod) from ConfigMap
+            - name: ENVIRONMENT
+              valueFrom:
+                configMapKeyRef:
+                  # Reference the ECTP configuration ConfigMap
+                  name: ectp-api-config
+                  # Key within the ConfigMap containing the environment name
+                  key: environment
+            # Port the application listens on (from ConfigMap)
+            - name: PORT
+              value: "8000"
+            # Number of Uvicorn worker processes (from ConfigMap)
+            - name: WORKERS
+              valueFrom:
+                configMapKeyRef:
+                  name: ectp-api-config
+                  key: workers
+            # Log level for the application (from ConfigMap)
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: ectp-api-config
+                  key: log-level
+            # Database connection URL (from Secret for credential protection)
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  # Reference the ECTP secrets Secret resource
+                  name: ectp-api-secrets
+                  # Key within the Secret containing the database URL
+                  key: database-url
+            # Redis connection URL (from Secret for credential protection)
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ectp-api-secrets
+                  key: redis-url
+            # JWT secret key for token signing (from Secret)
+            - name: SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ectp-api-secrets
+                  key: secret-key
+            # CORS allowed origins (from ConfigMap for environment-specific values)
+            - name: CORS_ORIGINS
+              valueFrom:
+                configMapKeyRef:
+                  name: ectp-api-config
+                  key: cors-origins
+
+          # -------------------------------------------------------------------
+          # resources: CPU and memory resource requests and limits.
+          # Requests: Minimum guaranteed resources for scheduling decisions.
+          # Limits: Maximum resources the container can use before throttling/OOM.
+          # -------------------------------------------------------------------
+          resources:
+            # Requests: Resources guaranteed to the container by the scheduler
+            requests:
+              # Minimum CPU allocation (250 millicores = 0.25 CPU cores)
+              cpu: "250m"
+              # Minimum memory allocation (256 MiB guaranteed)
+              memory: "256Mi"
+            # Limits: Maximum resources the container is allowed to consume
+            limits:
+              # Maximum CPU allocation (1000 millicores = 1 full CPU core)
+              cpu: "1000m"
+              # Maximum memory allocation (512 MiB before OOM kill)
+              memory: "512Mi"
+
+          # -------------------------------------------------------------------
+          # livenessProbe: Determines if the container is alive and running.
+          # If the liveness probe fails, Kubernetes restarts the container.
+          # This recovers from deadlocks and unresponsive application states.
+          # -------------------------------------------------------------------
+          livenessProbe:
+            httpGet:
+              # Path to the liveness endpoint in the application
+              path: /health
+              # Port to send the health check request to
+              port: http
+              # HTTP scheme (HTTP since this is internal pod-to-pod traffic)
+              scheme: HTTP
+            # initialDelaySeconds: Wait 30 seconds after container start before probing.
+            # This gives the application time to initialize connections and load config.
+            initialDelaySeconds: 30
+            # periodSeconds: Check liveness every 10 seconds
+            periodSeconds: 10
+            # timeoutSeconds: Fail the probe if no response within 5 seconds
+            timeoutSeconds: 5
+            # failureThreshold: Restart the container after 3 consecutive failures
+            # (3 failures * 10 second period = 30 seconds of unhealthiness before restart)
+            failureThreshold: 3
+            # successThreshold: 1 successful probe marks the container as alive again
+            successThreshold: 1
+
+          # -------------------------------------------------------------------
+          # readinessProbe: Determines if the container is ready to serve traffic.
+          # If the readiness probe fails, the pod is removed from the Service
+          # endpoints (no traffic is sent to it) but the container is NOT restarted.
+          # -------------------------------------------------------------------
+          readinessProbe:
+            httpGet:
+              # Path to the readiness endpoint (can check DB/Redis connectivity)
+              path: /health
+              # Port to check readiness on
+              port: http
+              scheme: HTTP
+            # initialDelaySeconds: Wait 15 seconds before first readiness check.
+            # Shorter than liveness because we want to start serving traffic ASAP.
+            initialDelaySeconds: 15
+            # periodSeconds: Check readiness every 5 seconds for quick recovery
+            periodSeconds: 5
+            # timeoutSeconds: Fail the probe if no response within 3 seconds
+            timeoutSeconds: 3
+            # failureThreshold: Remove from service after 3 consecutive failures
+            failureThreshold: 3
+            # successThreshold: 1 successful probe adds the pod back to the service
+            successThreshold: 1
+
+          # -------------------------------------------------------------------
+          # startupProbe: Determines if the application has started successfully.
+          # During startup, liveness and readiness probes are disabled until
+          # the startup probe succeeds. This prevents premature restarts for
+          # applications with slow initialization (DB migrations, cache warming).
+          # -------------------------------------------------------------------
+          startupProbe:
+            httpGet:
+              # Path to the startup check endpoint
+              path: /health
+              # Port for the startup check
+              port: http
+              scheme: HTTP
+            # periodSeconds: Check every 5 seconds during startup
+            periodSeconds: 5
+            # failureThreshold: Allow 30 failures (30 * 5s = 150s max startup time)
+            # This gives the app up to 2.5 minutes to fully initialize
+            failureThreshold: 30
+            # timeoutSeconds: Each probe attempt times out after 3 seconds
+            timeoutSeconds: 3
+
+          # -------------------------------------------------------------------
+          # securityContext: Container-level security settings.
+          # These override or supplement the pod-level securityContext above.
+          # -------------------------------------------------------------------
+          securityContext:
+            # allowPrivilegeEscalation: Prevent the process from gaining more
+            # privileges than its parent process (prevents setuid exploitation)
+            allowPrivilegeEscalation: false
+            # readOnlyRootFilesystem: Mount the container's root filesystem as read-only.
+            # This prevents attackers from modifying application binaries or configs.
+            readOnlyRootFilesystem: true
+            # capabilities: Explicitly drop all Linux capabilities.
+            # By default containers get some capabilities; dropping all provides
+            # the principle of least privilege.
+            capabilities:
+              drop:
+                # Drop ALL Linux capabilities for maximum security
+                - ALL
+
+          # -------------------------------------------------------------------
+          # volumeMounts: Mount volumes into the container filesystem.
+          # Since readOnlyRootFilesystem is true, we need writable mounts
+          # for directories where the application needs to write at runtime.
+          # -------------------------------------------------------------------
+          volumeMounts:
+            # Mount a writable temporary directory for runtime temp files
+            - name: tmp-volume
+              mountPath: /tmp
+              # Mount path inside the container for temporary files
+            # Mount a writable directory for application log files
+            - name: log-volume
+              mountPath: /app/logs
+              # Mount path for application log output
+            # Mount a writable directory for the app's tmp directory
+            - name: app-tmp-volume
+              mountPath: /app/tmp
+              # Mount path for application-specific temporary files
+
+      # ---------------------------------------------------------------------------
+      # volumes: Define the volumes referenced by volumeMounts above.
+      # Using emptyDir volumes provides writable storage backed by node disk
+      # or memory (medium: Memory). These are ephemeral and cleared on pod restart.
+      # ---------------------------------------------------------------------------
+      volumes:
+        # Temporary directory volume (writable, ephemeral)
+        - name: tmp-volume
+          emptyDir:
+            # Use memory-backed tmpfs for the /tmp directory
+            # This is faster than disk and ensures temp files don't persist
+            medium: Memory
+            # Limit the tmpfs size to 100Mi to prevent memory exhaustion
+            sizeLimit: "100Mi"
+        # Log directory volume (writable, ephemeral)
+        - name: log-volume
+          emptyDir:
+            # Use disk-backed storage for logs (can be larger than memory-backed)
+            {}
+        # Application temp directory volume (writable, ephemeral)
+        - name: app-tmp-volume
+          emptyDir:
+            # Use memory-backed tmpfs for application temp files
+            medium: Memory
+            # Limit to 50Mi to prevent memory exhaustion
+            sizeLimit: "50Mi"

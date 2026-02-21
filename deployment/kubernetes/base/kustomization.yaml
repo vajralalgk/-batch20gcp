@@ -1,0 +1,164 @@
+# =============================================================================
+# Enterprise Cloud Transformation Platform (ECTP) - Kustomize Base Configuration
+# =============================================================================
+# Author: Gopi Krishna Vajrala
+# Description: Kustomize base configuration for the ECTP Kubernetes resources.
+#              Kustomize provides template-free customization of Kubernetes
+#              manifests. This base configuration defines the common resources,
+#              labels, and configuration shared across all environments.
+#              Environment-specific overlays (dev, qa, uat, prod) extend this
+#              base with patches for replica counts, resource limits, image
+#              tags, and environment variables.
+#
+# Usage:
+#   Preview rendered manifests: kubectl kustomize deployment/kubernetes/base/
+#   Apply to cluster:           kubectl apply -k deployment/kubernetes/base/
+#   Apply overlay (e.g., dev):  kubectl apply -k deployment/kubernetes/overlays/dev/
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# apiVersion: The Kustomize API version for this configuration file.
+# kustomize.config.k8s.io/v1beta1 is the stable API version for Kustomize.
+# ---------------------------------------------------------------------------
+apiVersion: kustomize.config.k8s.io/v1beta1
+
+# ---------------------------------------------------------------------------
+# kind: The resource type for this file. Kustomization indicates this is
+# a Kustomize configuration file (the entry point for kustomize build).
+# ---------------------------------------------------------------------------
+kind: Kustomization
+
+# ---------------------------------------------------------------------------
+# namespace: The default namespace applied to all resources in this base.
+# All resources will be created in the 'ectp' namespace unless overridden
+# by an overlay. Using a dedicated namespace provides:
+#   - Resource isolation from other applications in the cluster
+#   - Namespace-scoped RBAC for access control
+#   - Resource quotas and limit ranges per namespace
+#   - Network policies for namespace-level traffic control
+# ---------------------------------------------------------------------------
+namespace: ectp
+
+# ---------------------------------------------------------------------------
+# commonLabels: Labels applied to ALL resources managed by this Kustomization.
+# These labels are added to every resource's metadata.labels AND to any
+# selectors that reference those resources. This ensures consistent labeling
+# across all ECTP Kubernetes resources for querying and management.
+#
+# WARNING: Changing commonLabels after initial deployment can break selector
+# matching, causing Services to lose track of their pods. Be careful with
+# label changes on running systems.
+# ---------------------------------------------------------------------------
+commonLabels:
+  # Application name following Kubernetes recommended label conventions
+  # Used by Services, Ingress, and monitoring to identify ECTP resources
+  app.kubernetes.io/name: ectp-api
+  # Part-of label grouping all ECTP resources together
+  # Useful for dashboard queries showing all ECTP components
+  app.kubernetes.io/part-of: ectp
+  # Managed-by label indicating these resources are managed by Kustomize
+  # Helps operators understand how resources should be modified (via Kustomize, not kubectl edit)
+  app.kubernetes.io/managed-by: kustomize
+
+# ---------------------------------------------------------------------------
+# commonAnnotations: Annotations applied to ALL resources in this Kustomization.
+# Unlike labels, annotations are not used for selection. They provide
+# metadata for tools, operators, and documentation purposes.
+# ---------------------------------------------------------------------------
+commonAnnotations:
+  # Team that owns and maintains these Kubernetes resources
+  team: "ectp-platform"
+  # Contact information for the owning team
+  contact: "ectp-platform@example.com"
+  # Project identifier for cost allocation and resource tracking
+  project: "ectp"
+
+# ---------------------------------------------------------------------------
+# resources: List of Kubernetes manifest files included in this base.
+# These files define the core resources that make up the ECTP deployment.
+# Kustomize processes all listed resources and applies labels, annotations,
+# namespace, and any patches defined in this or overlay kustomization files.
+#
+# Resources are listed in dependency order:
+#   1. Deployment - Defines the pods and their configuration
+#   2. Service - Provides network access to the pods
+# ---------------------------------------------------------------------------
+resources:
+  # Deployment manifest: Defines the ECTP API pod specification including
+  # container image, environment variables, health checks, resource limits,
+  # security context, and rolling update strategy.
+  - deployment.yaml
+
+  # Service manifest: Defines the ClusterIP Service that provides a stable
+  # network endpoint for the ECTP API pods, enabling internal load balancing
+  # and service discovery via Kubernetes DNS.
+  - service.yaml
+
+# ---------------------------------------------------------------------------
+# images: Image customization allows changing the container image name and tag
+# without patching the Deployment directly. This is the recommended way to
+# update image references across environments.
+#
+# Overlays override newTag to deploy different versions per environment.
+# The CI/CD pipeline sets the tag to the Git commit SHA for traceability.
+# ---------------------------------------------------------------------------
+images:
+  # Image transformation for the ECTP API container
+  - name: ectp-api
+    # name: Matches the 'image' field in the Deployment container spec.
+    # Kustomize finds containers using this image name and applies the transforms.
+    newName: ectp-api
+    # newName: The full image name (registry/repository) to use.
+    # In overlays, this is set to the ECR registry URL:
+    # e.g., 123456789012.dkr.ecr.us-east-1.amazonaws.com/ectp-api
+    newTag: latest
+    # newTag: The image tag to deploy. Defaults to 'latest' in the base.
+    # Overlays set this to the specific commit SHA or release version:
+    # e.g., abc123def456 (commit SHA) or v2.3.1 (semantic version)
+
+# ---------------------------------------------------------------------------
+# configMapGenerator: Automatically generate ConfigMap resources from
+# literal key-value pairs or files. This is cleaner than maintaining
+# separate ConfigMap YAML files and allows easy per-environment overrides.
+#
+# The generated ConfigMap name includes a hash suffix for automatic rollout:
+# when ConfigMap values change, a new ConfigMap is created with a new hash,
+# causing the Deployment to update and roll out new pods automatically.
+# ---------------------------------------------------------------------------
+configMapGenerator:
+  # ConfigMap for ECTP API application configuration
+  - name: ectp-api-config
+    # name: The base name for the generated ConfigMap
+    # The actual name will be: ectp-api-config-<hash> (hash of the contents)
+    literals:
+      # Environment identifier used by the application for environment-specific behavior
+      # Overlays change this to: dev, qa, uat, or prod
+      - environment=development
+      # Number of Uvicorn worker processes to run
+      # dev/qa: 2, uat: 3, prod: 4 (adjusted by overlays based on pod CPU)
+      - workers=4
+      # Application log level (debug for dev, info for prod)
+      # Overlays adjust this per environment
+      - log-level=info
+      # CORS allowed origins for cross-origin requests
+      # Environment-specific origins are set in overlays
+      - cors-origins=https://app.ectp.example.com
+
+# ---------------------------------------------------------------------------
+# generatorOptions: Configuration for all generators (configMapGenerator,
+# secretGenerator). These options control how generated resources behave.
+# ---------------------------------------------------------------------------
+generatorOptions:
+  # disableNameSuffixHash: When false (default), generated ConfigMaps and Secrets
+  # get a hash suffix appended to their name. This causes automatic rollouts
+  # when config values change, as the Deployment references the new name.
+  # Set to true only if you want to update ConfigMaps in-place without rollouts.
+  disableNameSuffixHash: false
+  # Labels added to all generated ConfigMaps and Secrets
+  labels:
+    # Label identifying generated resources as configuration for ectp-api
+    app.kubernetes.io/name: ectp-api
+  # Annotations added to all generated ConfigMaps and Secrets
+  annotations:
+    # Annotation indicating these are generated by Kustomize, not manually created
+    note: "Generated by Kustomize - do not edit directly"

@@ -1,0 +1,69 @@
+# ============================================================================
+# Enterprise Cloud Transformation Platform (ECTP) - Git Ignore
+# Author: Gopi Krishna Vajrala
+# ============================================================================
+
+# --- Environment & Secrets ---
+.env
+.env.local
+.env.production
+*.pem
+*.key
+*.crt
+credentials.json
+secrets.yaml
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.tox/
+venv/
+.venv/
+
+# --- Terraform ---
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# --- IDE ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# --- Node (build tools) ---
+node_modules/
+package-lock.json
+
+# --- Docker ---
+docker-compose.override.yml
+
+# --- Logs ---
+*.log
+logs/
+
+# --- OS ---
+Thumbs.db
+.DS_Store

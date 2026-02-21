@@ -1,0 +1,89 @@
+# ============================================================================
+# Enterprise Cloud Transformation Platform (ECTP)
+# Python Project Configuration
+# Author: Gopi Krishna Vajrala
+# ============================================================================
+
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ectp"
+version = "1.0.0"
+description = "Enterprise Cloud Transformation Platform for Higher Education"
+readme = "README.md"
+license = {text = "Proprietary"}
+requires-python = ">=3.11"
+authors = [
+    {name = "Gopi Krishna Vajrala"},
+]
+
+[tool.pytest.ini_options]
+# WHY: Centralized pytest configuration ensures consistent test behavior
+# across all developers and CI/CD environments.
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# asyncio_mode auto means async tests don't need @pytest.mark.asyncio decorator
+asyncio_mode = "auto"
+# Show extra test summary for failed, error, and skipped tests
+addopts = "-v --strict-markers --tb=short"
+markers = [
+    "unit: Unit tests (fast, no external dependencies)",
+    "integration: Integration tests (require database/redis)",
+    "e2e: End-to-end tests (require full environment)",
+    "performance: Performance/load tests",
+    "security: Security scanning tests",
+    "slow: Tests that take more than 10 seconds",
+]
+
+[tool.black]
+# WHY: Consistent code formatting eliminates style debates in code reviews
+line-length = 120
+target-version = ["py311"]
+include = '\.pyi?$'
+
+[tool.isort]
+# WHY: Consistent import ordering makes files easier to scan
+profile = "black"
+line_length = 120
+known_first_party = ["src"]
+
+[tool.mypy]
+# WHY: Static type checking catches bugs before runtime
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+check_untyped_defs = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.flake8]
+# WHY: Linting enforces code quality standards
+max-line-length = 120
+exclude = [".git", "__pycache__", ".venv", "build", "dist"]
+# E501: line too long (handled by black)
+# W503: line break before binary operator (conflicts with black)
+ignore = ["E501", "W503"]
+
+[tool.coverage.run]
+# WHY: Code coverage tracking ensures test completeness
+source = ["src"]
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+    "*/migrations/*",
+]
+
+[tool.coverage.report]
+# Minimum coverage threshold — fail CI if below this
+fail_under = 80
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.",
+]

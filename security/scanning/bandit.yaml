@@ -1,0 +1,40 @@
+# ============================================================================
+# Enterprise Cloud Transformation Platform (ECTP) - Bandit Security Config
+# Author: Gopi Krishna Vajrala
+# ============================================================================
+# Bandit is a Python static analysis tool for finding security issues.
+# WHY: Automated security scanning catches common vulnerabilities
+# before they reach production (shift-left security).
+# ============================================================================
+
+# Skip these test IDs (false positives for our use cases)
+skips:
+  # B101: assert_used — We use assert in tests (not production code)
+  - B101
+  # B601: paramiko_calls — We don't use paramiko
+  - B601
+
+# Only scan these directories
+targets:
+  - src/
+
+# Exclude test files from security scanning
+# WHY: Test files often contain hardcoded test credentials,
+# which are expected and not a security issue.
+exclude_dirs:
+  - tests/
+  - .venv/
+  - .git/
+  - __pycache__/
+
+# Severity levels to report
+# WHY: LOW severity findings are often false positives.
+# We focus on MEDIUM and HIGH to reduce noise.
+severity:
+  - MEDIUM
+  - HIGH
+
+# Confidence levels to report
+confidence:
+  - MEDIUM
+  - HIGH

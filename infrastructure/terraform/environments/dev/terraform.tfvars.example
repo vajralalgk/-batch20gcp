@@ -1,0 +1,97 @@
+# =============================================================================
+# Enterprise Cloud Transformation Platform (ECTP) - Dev Environment Variables
+# =============================================================================
+# Author: Gopi Krishna Vajrala
+# Description: Example variable values for the ECTP dev environment.
+#              Copy this file to terraform.tfvars and fill in actual values.
+#
+# Usage:
+#   1. Copy this file: cp terraform.tfvars.example terraform.tfvars
+#   2. Replace placeholder values with actual values for your dev environment
+#   3. NEVER commit terraform.tfvars to version control (it may contain secrets)
+#   4. The .gitignore should exclude *.tfvars files
+#
+# Security Notice:
+#   - This file should NOT contain actual secrets or credentials
+#   - Actual credentials are managed via Secrets Manager by the security module
+#   - The container_image should reference your private ECR repository
+#   - Alert emails should be real team member addresses for notification testing
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# AWS Region Configuration
+# -----------------------------------------------------------------------------
+# The AWS region where all dev environment resources will be deployed.
+# US East 1 is recommended for broadest service availability and lowest latency
+# for teams on the US East Coast.
+# Choose the region closest to your development team for best experience.
+aws_region = "us-east-1"
+
+# -----------------------------------------------------------------------------
+# Project Identification
+# -----------------------------------------------------------------------------
+# The project name used as a prefix for all resource names across modules.
+# This value is used in naming conventions: {project_name}-{environment}-{resource}
+# Must be lowercase alphanumeric with hyphens only (2-21 characters).
+project_name = "ectp"
+
+# -----------------------------------------------------------------------------
+# Environment Name
+# -----------------------------------------------------------------------------
+# The deployment environment identifier. For this configuration file, this
+# should always be "dev". Other valid values are "staging" and "prod", which
+# have their own environment directories and tfvars files.
+environment = "dev"
+
+# -----------------------------------------------------------------------------
+# Container Image Configuration
+# -----------------------------------------------------------------------------
+# The Docker container image URI for the ECTP FastAPI application.
+# This should point to your private ECR repository with a specific image tag.
+# NEVER use "latest" tag in any environment; always use a specific version
+# or commit SHA for deterministic deployments.
+#
+# Format: {account_id}.dkr.ecr.{region}.amazonaws.com/{repo_name}:{tag}
+# Example: 123456789012.dkr.ecr.us-east-1.amazonaws.com/ectp-api:v1.0.0
+#
+# Replace with your actual ECR repository URI and image tag.
+container_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/ectp-api:latest"
+
+# -----------------------------------------------------------------------------
+# ACM Certificate Configuration (Optional for Dev)
+# -----------------------------------------------------------------------------
+# The ARN of an ACM certificate for HTTPS termination on the ALB.
+# In dev environments, this is optional. If not provided, the ALB will
+# serve HTTP traffic directly (port 80 only, no HTTPS redirect).
+#
+# For production, this MUST be set to enable HTTPS for FERPA compliance.
+# The certificate must be in the same region as the ALB.
+#
+# To create a certificate:
+#   1. Go to AWS Certificate Manager in the correct region
+#   2. Request a public certificate for your domain (e.g., dev.ectp.example.edu)
+#   3. Complete DNS validation
+#   4. Copy the certificate ARN here
+#
+# Format: arn:aws:acm:{region}:{account_id}:certificate/{certificate_id}
+# Leave empty string "" for HTTP-only dev environments.
+acm_certificate_arn = ""
+
+# -----------------------------------------------------------------------------
+# Alert Email Configuration
+# -----------------------------------------------------------------------------
+# List of email addresses to receive CloudWatch alarm notifications.
+# Each email address will receive a confirmation email from AWS SNS that
+# must be confirmed before notifications are delivered.
+#
+# Recommended recipients for dev:
+#   - Lead developer for the ECTP project
+#   - DevOps/SRE team lead
+#   - Shared team distribution list
+#
+# Each email gets its own SNS subscription that can be independently managed.
+# Add or remove emails as team membership changes.
+alert_emails = [
+  "dev-team@example.edu",
+  "devops@example.edu"
+]

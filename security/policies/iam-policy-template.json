@@ -1,0 +1,128 @@
+{
+    "_comment": "ECTP IAM Policy Template - Author: Gopi Krishna Vajrala. This policy follows the principle of least privilege, granting only the permissions needed for the ECTP application to function.",
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "ECTPReadS3Buckets",
+            "Effect": "Allow",
+            "Action": [
+                "s3:GetObject",
+                "s3:ListBucket",
+                "s3:GetBucketLocation"
+            ],
+            "Resource": [
+                "arn:aws:s3:::ectp-*",
+                "arn:aws:s3:::ectp-*/*"
+            ],
+            "Condition": {
+                "StringEquals": {
+                    "aws:RequestedRegion": "us-east-1"
+                }
+            }
+        },
+        {
+            "Sid": "ECTPWriteS3Buckets",
+            "Effect": "Allow",
+            "Action": [
+                "s3:PutObject",
+                "s3:DeleteObject"
+            ],
+            "Resource": [
+                "arn:aws:s3:::ectp-data-*/*",
+                "arn:aws:s3:::ectp-logs-*/*"
+            ]
+        },
+        {
+            "Sid": "ECTPSecretsManager",
+            "Effect": "Allow",
+            "Action": [
+                "secretsmanager:GetSecretValue",
+                "secretsmanager:DescribeSecret"
+            ],
+            "Resource": [
+                "arn:aws:secretsmanager:us-east-1:*:secret:ectp/*"
+            ]
+        },
+        {
+            "Sid": "ECTPCloudWatchLogs",
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents",
+                "logs:DescribeLogStreams"
+            ],
+            "Resource": [
+                "arn:aws:logs:us-east-1:*:log-group:/ectp/*"
+            ]
+        },
+        {
+            "Sid": "ECTPCloudWatchMetrics",
+            "Effect": "Allow",
+            "Action": [
+                "cloudwatch:PutMetricData",
+                "cloudwatch:GetMetricData",
+                "cloudwatch:ListMetrics"
+            ],
+            "Resource": "*",
+            "Condition": {
+                "StringEquals": {
+                    "cloudwatch:namespace": "ECTP"
+                }
+            }
+        },
+        {
+            "Sid": "ECTPSQS",
+            "Effect": "Allow",
+            "Action": [
+                "sqs:SendMessage",
+                "sqs:ReceiveMessage",
+                "sqs:DeleteMessage",
+                "sqs:GetQueueAttributes"
+            ],
+            "Resource": [
+                "arn:aws:sqs:us-east-1:*:ectp-*"
+            ]
+        },
+        {
+            "Sid": "ECTPSNS",
+            "Effect": "Allow",
+            "Action": [
+                "sns:Publish"
+            ],
+            "Resource": [
+                "arn:aws:sns:us-east-1:*:ectp-*"
+            ]
+        },
+        {
+            "Sid": "ECTPKMS",
+            "Effect": "Allow",
+            "Action": [
+                "kms:Decrypt",
+                "kms:GenerateDataKey"
+            ],
+            "Resource": [
+                "arn:aws:kms:us-east-1:*:key/*"
+            ],
+            "Condition": {
+                "StringEquals": {
+                    "kms:ViaService": [
+                        "s3.us-east-1.amazonaws.com",
+                        "secretsmanager.us-east-1.amazonaws.com",
+                        "rds.us-east-1.amazonaws.com"
+                    ]
+                }
+            }
+        },
+        {
+            "Sid": "ECTPCostExplorer",
+            "Effect": "Allow",
+            "Action": [
+                "ce:GetCostAndUsage",
+                "ce:GetCostForecast",
+                "ce:GetReservationUtilization"
+            ],
+            "Resource": "*"
+        }
+    ]
+}

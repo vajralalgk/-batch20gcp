@@ -1,0 +1,305 @@
+# =============================================================================
+# Enterprise Cloud Transformation Platform (ECTP) - Docker Compose Configuration
+# =============================================================================
+# Author: Gopi Krishna Vajrala
+# Description: Docker Compose configuration for local development environment.
+#              Sets up the complete ECTP stack including the FastAPI application,
+#              PostgreSQL database, and Redis cache. All services are connected
+#              via a dedicated Docker network with persistent volumes for data.
+#
+# Usage:
+#   Start all services:     docker compose up -d
+#   Stop all services:      docker compose down
+#   View logs:              docker compose logs -f
+#   Rebuild and start:      docker compose up -d --build
+#   Remove volumes (reset): docker compose down -v
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Compose file version: Using the latest Compose specification.
+# The 'version' key is optional in modern Docker Compose (v2+) and is
+# included here for backward compatibility with older Docker Compose versions.
+# ---------------------------------------------------------------------------
+version: "3.9"
+
+# ===========================================================================
+# SERVICES: Define all containers that make up the ECTP development stack.
+# Each service maps to a running container with its own configuration.
+# ===========================================================================
+services:
+
+  # =========================================================================
+  # SERVICE: ECTP FastAPI Application
+  # =========================================================================
+  # The main application service running the ECTP FastAPI backend.
+  # In development mode, source code is mounted as a volume for live reloading.
+  # =========================================================================
+  app:
+    # Human-readable name for the container (shown in docker ps output)
+    container_name: ectp-api
+    # Build configuration: Build the Docker image from the local Dockerfile
+    build:
+      # Build context is the repository root (two levels up from this file)
+      # This allows the Dockerfile to COPY files from anywhere in the repo
+      context: ../../
+      # Path to the Dockerfile relative to the build context
+      dockerfile: deployment/docker/Dockerfile
+      # Build arguments passed to the Dockerfile during image construction
+      args:
+        # Set build date for image metadata labeling
+        BUILD_DATE: "local-dev"
+        # Set VCS reference to indicate this is a local development build
+        VCS_REF: "local"
+        # Set version to indicate development build
+        VERSION: "dev"
+    # Port mapping: Map host port 8000 to container port 8000
+    # Format: HOST_PORT:CONTAINER_PORT
+    # Access the API at http://localhost:8000 from your host machine
+    ports:
+      - "8000:8000"
+        # Map port 8000 on the host to port 8000 in the container
+    # Volume mounts for development: Mount source code for live reloading
+    volumes:
+      - ../../src:/app/src:cached
+        # Mount the local src directory into the container's /app/src
+        # :cached mode optimizes file system performance on macOS Docker Desktop
+        # Changes to source code on the host are immediately reflected in the container
+      - app-logs:/app/logs
+        # Named volume for application logs to persist across container restarts
+        # Logs are preserved even when the container is recreated
+    # Environment variables for the application container
+    # These configure database connections, Redis, and application behavior
+    environment:
+      # Set the runtime environment to 'development' for dev-specific behavior
+      # This enables debug mode, detailed error responses, and auto-reload
+      - ENVIRONMENT=development
+      # PostgreSQL connection string pointing to the postgres service container
+      # Uses the Docker Compose service name 'postgres' as the hostname
+      # Docker's internal DNS resolves 'postgres' to the container's IP address
+      - DATABASE_URL=postgresql://ectp_user:ectp_dev_password@postgres:5432/ectp_dev
+      # Redis connection string pointing to the redis service container
+      # Uses the Docker Compose service name 'redis' as the hostname
+      - REDIS_URL=redis://redis:6379/0
+      # Application port (matches the EXPOSE in the Dockerfile)
+      - PORT=8000
+      # Number of Uvicorn workers (1 for development to simplify debugging)
+      # In production, this would be set to match CPU core count
+      - WORKERS=1
+      # Enable debug mode for detailed error responses and stack traces
+      - DEBUG=true
+      # Set the log level to DEBUG for maximum verbosity during development
+      - LOG_LEVEL=debug
+      # Secret key for JWT token signing (development-only value)
+      # SECURITY: This must be different in each deployed environment
+      - SECRET_KEY=dev-secret-key-do-not-use-in-production
+      # CORS allowed origins for local frontend development
+      # Allows requests from common local development ports
+      - CORS_ORIGINS=http://localhost:3000,http://localhost:8080
+    # Service dependencies: Ensure postgres and redis start before the app
+    # depends_on with condition ensures the dependencies are actually healthy,
+    # not just started, before the app container begins
+    depends_on:
+      # Wait for PostgreSQL to be healthy (accepting connections) before starting
+      postgres:
+        # Use the health check defined on the postgres service
+        condition: service_healthy
+      # Wait for Redis to be healthy (responding to PING) before starting
+      redis:
+        # Use the health check defined on the redis service
+        condition: service_healthy
+    # Network configuration: Connect to the dedicated ECTP network
+    networks:
+      - ectp-network
+        # Attach to the ectp-network for inter-service communication
+    # Restart policy: Automatically restart the container on failure
+    # 'unless-stopped' restarts on failure but not when manually stopped
+    restart: unless-stopped
+    # Health check: Verify the application is responding to HTTP requests
+    healthcheck:
+      # Use curl to check the /health endpoint for application readiness
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8000/health"]
+      # Check health every 30 seconds
+      interval: 30s
+      # Fail the health check if no response within 10 seconds
+      timeout: 10s
+      # Mark unhealthy after 3 consecutive failures
+      retries: 3
+      # Wait 30 seconds after container start before first health check
+      start_period: 30s
+    # Override the default command for development mode with auto-reload enabled
+    command: >
+      uvicorn src.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+      --reload-dir /app/src
+      --log-level debug
+      --access-log
+    # --reload: Enable auto-reload when source files change (development only)
+    # --reload-dir: Watch only the src directory for changes (faster reload)
+    # --log-level debug: Maximum logging verbosity for development debugging
+
+  # =========================================================================
+  # SERVICE: PostgreSQL Database
+  # =========================================================================
+  # PostgreSQL 15 database for persistent data storage.
+  # Data is persisted using a named Docker volume that survives container
+  # restarts and rebuilds. Only destroyed with 'docker compose down -v'.
+  # =========================================================================
+  postgres:
+    # Human-readable container name for easy identification
+    container_name: ectp-postgres
+    # Use the official PostgreSQL 15 Alpine image for minimal footprint
+    # Alpine-based images are significantly smaller than Debian-based ones
+    image: postgres:15-alpine
+    # Port mapping: Expose PostgreSQL on the standard port for local tool access
+    # This allows connecting from host tools like pgAdmin, DBeaver, or psql
+    ports:
+      - "5432:5432"
+        # Map host port 5432 to container port 5432 (PostgreSQL default)
+    # Volume mounts: Persist database data and initialize with custom scripts
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+        # Named volume for PostgreSQL data files. This ensures data persists
+        # across container restarts, image rebuilds, and compose up/down cycles.
+        # The data is only lost when explicitly running 'docker compose down -v'.
+      # Uncomment the line below to automatically run SQL scripts on first startup:
+      # - ./init-scripts:/docker-entrypoint-initdb.d
+        # Files in /docker-entrypoint-initdb.d are executed alphabetically
+        # on the FIRST startup of a new database. They are skipped on restarts.
+    # Environment variables to configure the PostgreSQL instance
+    environment:
+      # Set the superuser password for the PostgreSQL instance
+      # SECURITY: Use a strong, unique password in non-local environments
+      - POSTGRES_PASSWORD=ectp_dev_password
+      # Create a dedicated database for the ECTP application on first startup
+      - POSTGRES_DB=ectp_dev
+      # Create a dedicated user with access to the ECTP database
+      - POSTGRES_USER=ectp_user
+      # Set the PostgreSQL data directory explicitly (matches volume mount)
+      - PGDATA=/var/lib/postgresql/data/pgdata
+      # Shared memory size for PostgreSQL (important for performance tuning)
+      # Default Docker shared memory (64MB) is too small for PostgreSQL
+    # Shared memory size: Increase from Docker's default 64MB to 256MB
+    # PostgreSQL uses shared memory for shared buffers and other internal structures
+    shm_size: "256mb"
+    # Network configuration: Connect to the ECTP network for app connectivity
+    networks:
+      - ectp-network
+        # Attach to the same network as the app service for DNS-based discovery
+    # Restart policy: Always restart to maintain database availability
+    restart: unless-stopped
+    # Health check: Verify PostgreSQL is accepting connections and ready for queries
+    healthcheck:
+      # Use pg_isready to check if PostgreSQL is accepting connections
+      # -U: Connect as the ectp_user
+      # -d: Check the ectp_dev database specifically
+      test: ["CMD-SHELL", "pg_isready -U ectp_user -d ectp_dev"]
+      # Check health every 10 seconds for quick detection of database issues
+      interval: 10s
+      # Fail the health check if no response within 5 seconds
+      timeout: 5s
+      # Mark unhealthy after 5 consecutive failures (gives PostgreSQL time to recover)
+      retries: 5
+      # Wait 10 seconds after container start before the first health check
+      start_period: 10s
+
+  # =========================================================================
+  # SERVICE: Redis Cache
+  # =========================================================================
+  # Redis 7 in-memory data store used for caching, session management,
+  # and rate limiting. Data is persisted using appendonly mode for durability.
+  # =========================================================================
+  redis:
+    # Human-readable container name for easy identification
+    container_name: ectp-redis
+    # Use the official Redis 7 Alpine image for minimal footprint
+    image: redis:7-alpine
+    # Port mapping: Expose Redis on the standard port for local tool access
+    # Allows connecting from host tools like redis-cli or RedisInsight
+    ports:
+      - "6379:6379"
+        # Map host port 6379 to container port 6379 (Redis default)
+    # Volume mounts: Persist Redis data across container restarts
+    volumes:
+      - redis-data:/data
+        # Named volume for Redis data persistence. Redis stores its
+        # append-only file (AOF) and RDB snapshots in the /data directory.
+        # This ensures cached data survives container restarts.
+    # Custom Redis command with configuration flags for development use
+    # These flags configure Redis behavior without needing a redis.conf file
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+      --loglevel notice
+    # redis-server: Start the Redis server process
+    # --appendonly yes: Enable append-only file for data persistence (durability)
+    # --maxmemory 256mb: Limit Redis memory usage to 256MB for local development
+    # --maxmemory-policy allkeys-lru: Evict least-recently-used keys when memory is full
+    # --save 60 1000: Create an RDB snapshot every 60 seconds if 1000+ keys changed
+    # --loglevel notice: Standard logging level (info about important events)
+    # Network configuration: Connect to the ECTP network for app connectivity
+    networks:
+      - ectp-network
+        # Attach to the same network as the app and postgres services
+    # Restart policy: Always restart to maintain cache availability
+    restart: unless-stopped
+    # Health check: Verify Redis is accepting connections and responding to commands
+    healthcheck:
+      # Use redis-cli PING to check if Redis is alive and responding
+      # A healthy Redis server responds with "PONG"
+      test: ["CMD", "redis-cli", "ping"]
+      # Check health every 10 seconds
+      interval: 10s
+      # Fail the health check if no response within 5 seconds
+      timeout: 5s
+      # Mark unhealthy after 3 consecutive failures
+      retries: 3
+      # Wait 5 seconds after container start before the first health check
+      start_period: 5s
+
+# ===========================================================================
+# NETWORKS: Define custom Docker networks for service communication.
+# Using a dedicated network provides DNS-based service discovery
+# (services can reach each other by container name) and network isolation
+# from other Docker containers on the host.
+# ===========================================================================
+networks:
+  # Dedicated network for all ECTP services
+  ectp-network:
+    # Use the bridge driver for single-host networking (standard for development)
+    # Bridge networks provide isolation and DNS-based service discovery
+    driver: bridge
+    # Human-readable name for the network (shown in 'docker network ls')
+    name: ectp-network
+
+# ===========================================================================
+# VOLUMES: Define named volumes for persistent data storage.
+# Named volumes are managed by Docker and persist data across container
+# lifecycle events (stop, start, rebuild). They are only removed when
+# explicitly deleted with 'docker volume rm' or 'docker compose down -v'.
+# ===========================================================================
+volumes:
+  # Named volume for PostgreSQL data files
+  postgres-data:
+    # Use the local driver for volumes stored on the host filesystem
+    driver: local
+    # Human-readable name for identification in 'docker volume ls'
+    name: ectp-postgres-data
+
+  # Named volume for Redis data persistence files (AOF and RDB snapshots)
+  redis-data:
+    # Use the local driver for host-based volume storage
+    driver: local
+    # Human-readable name for the Redis data volume
+    name: ectp-redis-data
+
+  # Named volume for application log files
+  app-logs:
+    # Use the local driver for log file storage
+    driver: local
+    # Human-readable name for the application logs volume
+    name: ectp-app-logs

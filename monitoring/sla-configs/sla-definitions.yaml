@@ -1,0 +1,103 @@
+# ============================================================================
+# Enterprise Cloud Transformation Platform (ECTP) - SLA Definitions
+# Author: Gopi Krishna Vajrala
+# ============================================================================
+
+sla_definitions:
+  # Tier 1: Mission-Critical Services
+  # WHY: These services directly impact student operations and must have
+  # the highest availability guarantees.
+  tier_1:
+    name: "Mission Critical"
+    services:
+      - "Student Registration API"
+      - "Financial Aid Processing"
+      - "Authentication Service"
+    availability_target: 99.95  # percent
+    rto: 15  # minutes - Recovery Time Objective
+    rpo: 0   # minutes - Recovery Point Objective (zero data loss)
+    latency_p99: 500  # milliseconds
+    error_rate_max: 0.1  # percent
+    support_hours: "24/7/365"
+    response_time:
+      P1: "15 minutes"
+      P2: "30 minutes"
+    escalation_path:
+      - "Cloud Operations Team"
+      - "IT Director"
+      - "CIO"
+
+  # Tier 2: Business-Important Services
+  tier_2:
+    name: "Business Important"
+    services:
+      - "ServiceNow Integration"
+      - "Ellucian Data Sync"
+      - "Cost Governance Dashboard"
+      - "Migration Management"
+    availability_target: 99.9
+    rto: 60  # minutes
+    rpo: 15  # minutes
+    latency_p99: 1000  # milliseconds
+    error_rate_max: 0.5  # percent
+    support_hours: "Business hours + on-call"
+    response_time:
+      P1: "30 minutes"
+      P2: "2 hours"
+
+  # Tier 3: Standard Services
+  tier_3:
+    name: "Standard"
+    services:
+      - "Reporting and Analytics"
+      - "Audit Log Viewer"
+      - "Compliance Dashboard"
+    availability_target: 99.5
+    rto: 240  # minutes (4 hours)
+    rpo: 60   # minutes
+    latency_p99: 2000  # milliseconds
+    error_rate_max: 1.0  # percent
+    support_hours: "Business hours"
+    response_time:
+      P1: "1 hour"
+      P2: "4 hours"
+
+  # Tier 4: Non-Critical Services
+  tier_4:
+    name: "Non-Critical"
+    services:
+      - "Development Tools"
+      - "Documentation Portal"
+      - "Training Environment"
+    availability_target: 99.0
+    rto: 1440  # minutes (24 hours)
+    rpo: 1440  # minutes (24 hours)
+    support_hours: "Business hours"
+
+# Maintenance Windows
+maintenance_windows:
+  standard:
+    day: "Sunday"
+    time: "02:00-06:00 UTC"
+    frequency: "Weekly"
+    notification_hours_before: 48
+  emergency:
+    approval_required: true
+    approver: "IT Director"
+    notification_hours_before: 2
+
+# SLA Reporting
+reporting:
+  frequency: "Monthly"
+  recipients:
+    - "CIO"
+    - "IT Director"
+    - "Cloud Operations Manager"
+    - "Department Heads"
+  metrics:
+    - "Availability percentage"
+    - "Incident count by severity"
+    - "Mean Time to Recovery"
+    - "Mean Time to Detect"
+    - "SLA breach count"
+    - "Cost vs budget"

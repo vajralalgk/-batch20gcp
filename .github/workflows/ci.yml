@@ -1,0 +1,660 @@
+# =============================================================================
+# Enterprise Cloud Transformation Platform (ECTP) - Continuous Integration Pipeline
+# =============================================================================
+# Author: Gopi Krishna Vajrala
+# Description: GitHub Actions CI pipeline implementing a multi-stage workflow
+#              that validates code quality, runs tests, performs security scans,
+#              builds Docker images, and pushes to Amazon ECR.
+# Stages: build -> test -> security -> deploy
+# Triggers: Pull requests and pushes to main and dev branches.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Name: Human-readable name for this workflow, displayed in the GitHub Actions UI
+# ---------------------------------------------------------------------------
+name: "ECTP CI Pipeline"
+
+# ---------------------------------------------------------------------------
+# Triggers: Define the events that will cause this workflow to execute.
+# - push: Fires when code is pushed directly to main or dev branches
+# - pull_request: Fires when a PR is opened/updated targeting main or dev
+# This ensures every code change is validated before and after merging.
+# ---------------------------------------------------------------------------
+on:
+  # Trigger on push events to the main (production) and dev (development) branches
+  push:
+    # Only run on pushes to these specific branches, not feature branches
+    branches:
+      - main        # Production branch - triggers full pipeline including ECR push
+      - dev         # Development branch - triggers full pipeline for pre-release validation
+    # Ignore pushes that only modify documentation files to save CI minutes
+    paths-ignore:
+      - "*.md"                  # Root-level markdown files like README.md
+      - "docs/**"               # Documentation directory contents
+      - ".github/ISSUE_TEMPLATE/**"  # Issue template changes don't need CI
+  # Trigger on pull request events targeting main or dev branches
+  pull_request:
+    # Run CI on PRs targeting these branches to validate before merge
+    branches:
+      - main        # PRs going to production must pass all checks
+      - dev         # PRs going to development must pass all checks
+    # Same path exclusions as push - documentation changes skip CI
+    paths-ignore:
+      - "*.md"                  # Root-level markdown files
+      - "docs/**"               # Documentation directory contents
+      - ".github/ISSUE_TEMPLATE/**"  # Issue template changes don't need CI
+
+# ---------------------------------------------------------------------------
+# Concurrency: Prevent multiple workflow runs for the same branch/PR from
+# running simultaneously. This saves CI minutes and prevents race conditions.
+# cancel-in-progress cancels older runs when a new push arrives.
+# ---------------------------------------------------------------------------
+concurrency:
+  # Group by workflow name + branch ref so each branch gets its own concurrency group
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  # Cancel any in-progress runs in the same group when a new run is triggered
+  cancel-in-progress: true
+
+# ---------------------------------------------------------------------------
+# Environment Variables: Shared across all jobs in this workflow.
+# These define the Python version, Docker registry, and application settings
+# used consistently throughout the pipeline stages.
+# ---------------------------------------------------------------------------
+env:
+  # Python version used across all jobs for consistency
+  PYTHON_VERSION: "3.11"
+  # Node.js version for any frontend tooling or linting dependencies
+  NODE_VERSION: "20"
+  # AWS region where ECR repository is hosted for Docker image storage
+  AWS_REGION: "us-east-1"
+  # Amazon ECR registry URL for pushing built Docker images
+  ECR_REGISTRY: "${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com"
+  # ECR repository name where ECTP images are stored and tagged
+  ECR_REPOSITORY: "ectp-api"
+  # Docker image tag derived from the git commit SHA for traceability
+  IMAGE_TAG: "${{ github.sha }}"
+
+# ===========================================================================
+# JOBS: Define the multi-stage pipeline. Each job runs in its own runner.
+# Execution order: lint -> type-check -> unit-tests -> integration-tests
+#                  -> security-scan -> docker-build -> push-to-ecr
+# Jobs with 'needs' run sequentially; jobs without run in parallel.
+# ===========================================================================
+jobs:
+
+  # =========================================================================
+  # STAGE 1: BUILD - Linting and Code Quality
+  # =========================================================================
+  # This job installs dependencies and runs code linting tools to enforce
+  # consistent code style and catch common programming errors early.
+  # =========================================================================
+  lint:
+    # Display name shown in the GitHub Actions UI for this job
+    name: "Stage 1 - Lint & Code Quality"
+    # Run on the latest Ubuntu runner provided by GitHub-hosted runners
+    runs-on: ubuntu-latest
+    # Set a maximum execution time to prevent runaway jobs from consuming resources
+    timeout-minutes: 10
+
+    # Steps execute sequentially within this job
+    steps:
+      # Step 1: Check out the repository code so the runner has access to it
+      - name: "Checkout repository source code"
+        # Uses the official GitHub checkout action (v4) to clone the repo
+        uses: actions/checkout@v4
+        with:
+          # Fetch full git history for accurate diff-based linting if needed
+          fetch-depth: 0
+
+      # Step 2: Set up the Python runtime environment with the specified version
+      - name: "Set up Python ${{ env.PYTHON_VERSION }}"
+        # Uses the official setup-python action to install and configure Python
+        uses: actions/setup-python@v5
+        with:
+          # Use the Python version defined in the workflow-level env vars
+          python-version: "${{ env.PYTHON_VERSION }}"
+          # Enable pip caching to speed up dependency installation on subsequent runs
+          cache: "pip"
+
+      # Step 3: Install Python dependencies needed for linting and the project
+      - name: "Install project dependencies and linting tools"
+        run: |
+          # Upgrade pip to the latest version to avoid compatibility issues
+          python -m pip install --upgrade pip
+          # Install the linting tools: flake8 for style, black for formatting,
+          # isort for import ordering, pylint for deeper static analysis
+          pip install flake8 black isort pylint
+          # Install project dependencies from requirements.txt if it exists
+          # The '|| true' ensures the step doesn't fail if the file is missing
+          pip install -r requirements.txt || true
+          # Install dev/test dependencies if a separate requirements-dev file exists
+          pip install -r requirements-dev.txt || true
+
+      # Step 4: Run flake8 linter to check for PEP 8 style violations and errors
+      - name: "Run flake8 linter for PEP 8 compliance"
+        run: |
+          # Execute flake8 on the src directory with specific configuration:
+          # --count: Print total number of errors at the end
+          # --select=E9,F63,F7,F82: Only check for critical errors (syntax, undefined names)
+          # --show-source: Show the source code line that caused each error
+          # --statistics: Show counts of each error type at the end
+          flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Run a second pass for warnings with relaxed settings:
+          # --exit-zero: Don't fail the build on warnings, only report them
+          # --max-complexity=10: Flag functions with cyclomatic complexity > 10
+          # --max-line-length=120: Allow lines up to 120 characters (wider than PEP 8's 79)
+          flake8 src/ --count --exit-zero --max-complexity=10 --max-line-length=120 --statistics
+
+      # Step 5: Verify code formatting with Black (the uncompromising code formatter)
+      - name: "Check code formatting with Black"
+        run: |
+          # Run Black in check mode (--check) which doesn't modify files,
+          # just reports whether files would be reformatted.
+          # --diff shows what changes would be made for developer reference.
+          # --line-length=120 matches our flake8 configuration above.
+          black --check --diff --line-length=120 src/
+
+      # Step 6: Verify import ordering with isort to maintain consistent import blocks
+      - name: "Check import ordering with isort"
+        run: |
+          # Run isort in check mode to verify imports are properly sorted.
+          # --check-only: Don't modify files, just report issues.
+          # --diff: Show what changes would be made.
+          # --profile=black: Use Black-compatible import formatting.
+          isort --check-only --diff --profile=black src/
+
+  # =========================================================================
+  # STAGE 1: BUILD - Type Checking
+  # =========================================================================
+  # This job performs static type analysis using mypy to catch type-related
+  # bugs before runtime. Runs in parallel with linting for faster feedback.
+  # =========================================================================
+  type-check:
+    # Display name for the type checking job in the GitHub Actions UI
+    name: "Stage 1 - Type Check (mypy)"
+    # Run on the latest Ubuntu runner
+    runs-on: ubuntu-latest
+    # Maximum time allowed for this job before it's automatically cancelled
+    timeout-minutes: 10
+
+    steps:
+      # Step 1: Check out the source code from the repository
+      - name: "Checkout repository source code"
+        uses: actions/checkout@v4
+
+      # Step 2: Configure the Python runtime environment
+      - name: "Set up Python ${{ env.PYTHON_VERSION }}"
+        uses: actions/setup-python@v5
+        with:
+          # Match the Python version used across all pipeline stages
+          python-version: "${{ env.PYTHON_VERSION }}"
+          # Cache pip packages to accelerate repeated runs
+          cache: "pip"
+
+      # Step 3: Install mypy and project dependencies for type resolution
+      - name: "Install mypy and project dependencies"
+        run: |
+          # Upgrade pip to latest version for best compatibility
+          python -m pip install --upgrade pip
+          # Install mypy type checker along with common type stub packages
+          # that provide type information for popular third-party libraries
+          pip install mypy types-requests types-redis
+          # Install project dependencies so mypy can resolve all imports
+          pip install -r requirements.txt || true
+
+      # Step 4: Execute mypy type checking against the source code
+      - name: "Run mypy static type analysis"
+        run: |
+          # Run mypy on the src directory with configuration:
+          # --ignore-missing-imports: Don't error on third-party packages without type stubs
+          # --no-strict-optional: Be lenient about Optional type usage
+          # --warn-return-any: Warn when a function returns Any type
+          # --warn-unused-configs: Warn about unused mypy configuration entries
+          # --show-error-codes: Display error codes for each issue for easier suppression
+          mypy src/ \
+            --ignore-missing-imports \
+            --no-strict-optional \
+            --warn-return-any \
+            --warn-unused-configs \
+            --show-error-codes
+
+  # =========================================================================
+  # STAGE 2: TEST - Unit Tests
+  # =========================================================================
+  # This job runs the unit test suite with pytest, generating coverage reports.
+  # It depends on the build stage (lint + type-check) passing first.
+  # =========================================================================
+  unit-tests:
+    # Display name for this job in the GitHub Actions UI
+    name: "Stage 2 - Unit Tests"
+    # Run on the latest Ubuntu runner
+    runs-on: ubuntu-latest
+    # This job requires both lint and type-check to pass before it starts
+    # This enforces the build -> test stage ordering
+    needs: [lint, type-check]
+    # Maximum execution time to prevent stuck test suites from blocking the pipeline
+    timeout-minutes: 20
+
+    steps:
+      # Step 1: Check out the repository code
+      - name: "Checkout repository source code"
+        uses: actions/checkout@v4
+
+      # Step 2: Set up Python for running tests
+      - name: "Set up Python ${{ env.PYTHON_VERSION }}"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "${{ env.PYTHON_VERSION }}"
+          cache: "pip"
+
+      # Step 3: Install all dependencies including test-specific packages
+      - name: "Install project and test dependencies"
+        run: |
+          # Upgrade pip to the latest version
+          python -m pip install --upgrade pip
+          # Install testing tools: pytest for test execution, pytest-cov for coverage,
+          # pytest-asyncio for async test support (FastAPI uses async handlers),
+          # pytest-xdist for parallel test execution to speed up the suite
+          pip install pytest pytest-cov pytest-asyncio pytest-xdist
+          # Install project dependencies
+          pip install -r requirements.txt || true
+          # Install development/test-specific dependencies
+          pip install -r requirements-dev.txt || true
+
+      # Step 4: Execute the unit test suite with coverage measurement
+      - name: "Run unit tests with coverage"
+        run: |
+          # Execute pytest with the following configuration:
+          # tests/unit/: Only run tests in the unit test directory
+          # -v: Verbose output showing individual test results
+          # --tb=short: Short traceback format for failures (easier to read in CI)
+          # --cov=src: Measure code coverage for the src directory
+          # --cov-report=xml:coverage.xml: Generate XML coverage report for upload
+          # --cov-report=term-missing: Show which lines are not covered in terminal output
+          # --cov-fail-under=80: Fail if coverage drops below 80% threshold
+          # -n auto: Use pytest-xdist to run tests in parallel across available CPUs
+          # --junitxml=test-results.xml: Generate JUnit XML report for GitHub integration
+          pytest tests/unit/ \
+            -v \
+            --tb=short \
+            --cov=src \
+            --cov-report=xml:coverage.xml \
+            --cov-report=term-missing \
+            --cov-fail-under=80 \
+            -n auto \
+            --junitxml=test-results.xml
+
+      # Step 5: Upload test results as an artifact for later review and analysis
+      - name: "Upload test results artifact"
+        # Always upload results, even if tests failed, for debugging purposes
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # Name for the artifact bundle in the GitHub Actions UI
+          name: unit-test-results
+          # Include both the JUnit XML results and the coverage XML report
+          path: |
+            test-results.xml
+            coverage.xml
+          # Keep artifacts for 30 days before automatic cleanup
+          retention-days: 30
+
+      # Step 6: Upload coverage report to Codecov for tracking coverage trends over time
+      - name: "Upload coverage to Codecov"
+        uses: codecov/codecov-action@v4
+        with:
+          # Path to the coverage report file generated by pytest-cov
+          file: ./coverage.xml
+          # Flag to identify this coverage report as from unit tests
+          flags: unittests
+          # Don't fail the build if the Codecov upload fails (external service)
+          fail_ci_if_error: false
+          # Authentication token for Codecov stored as a repository secret
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # =========================================================================
+  # STAGE 2: TEST - Integration Tests
+  # =========================================================================
+  # This job runs integration tests that validate interactions between
+  # components (API endpoints, database queries, Redis caching, etc.).
+  # Uses service containers for PostgreSQL and Redis.
+  # =========================================================================
+  integration-tests:
+    # Display name for the integration test job
+    name: "Stage 2 - Integration Tests"
+    # Run on the latest Ubuntu runner
+    runs-on: ubuntu-latest
+    # Depends on build stage passing first (lint and type-check)
+    needs: [lint, type-check]
+    # Integration tests may take longer due to database/service interactions
+    timeout-minutes: 30
+
+    # Service containers: Spin up PostgreSQL and Redis alongside the test runner
+    # These containers are networked with the runner and accessible via localhost
+    services:
+      # PostgreSQL service container for database integration tests
+      postgres:
+        # Use the official PostgreSQL 15 Alpine image (small footprint)
+        image: postgres:15-alpine
+        # Environment variables to configure the PostgreSQL instance
+        env:
+          # Set the superuser password for the test database
+          POSTGRES_PASSWORD: test_password
+          # Create a test-specific database automatically on startup
+          POSTGRES_DB: ectp_test
+          # Set the database user for authentication
+          POSTGRES_USER: ectp_user
+        # Map container port 5432 to host port 5432 for test access
+        ports:
+          - 5432:5432
+        # Health check to ensure PostgreSQL is ready before tests start
+        options: >-
+          --health-cmd="pg_isready -U ectp_user -d ectp_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+      # Redis service container for caching integration tests
+      redis:
+        # Use the official Redis 7 Alpine image (minimal footprint)
+        image: redis:7-alpine
+        # Map container port 6379 to host port 6379 for test access
+        ports:
+          - 6379:6379
+        # Health check to ensure Redis is ready and accepting connections
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    # Environment variables for connecting to the service containers
+    env:
+      # PostgreSQL connection string for the test database using service credentials
+      DATABASE_URL: "postgresql://ectp_user:test_password@localhost:5432/ectp_test"
+      # Redis connection URL pointing to the Redis service container
+      REDIS_URL: "redis://localhost:6379/0"
+      # Set environment to testing to enable test-specific configuration
+      ENVIRONMENT: "testing"
+
+    steps:
+      # Step 1: Check out the repository source code
+      - name: "Checkout repository source code"
+        uses: actions/checkout@v4
+
+      # Step 2: Configure Python for running integration tests
+      - name: "Set up Python ${{ env.PYTHON_VERSION }}"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "${{ env.PYTHON_VERSION }}"
+          cache: "pip"
+
+      # Step 3: Install project dependencies including database drivers
+      - name: "Install project and test dependencies"
+        run: |
+          # Upgrade pip for best compatibility
+          python -m pip install --upgrade pip
+          # Install test framework and async database drivers needed for integration tests
+          pip install pytest pytest-asyncio httpx
+          # Install project dependencies (includes FastAPI, SQLAlchemy, etc.)
+          pip install -r requirements.txt || true
+          # Install dev dependencies for testing utilities
+          pip install -r requirements-dev.txt || true
+
+      # Step 4: Execute integration tests against the service containers
+      - name: "Run integration tests"
+        run: |
+          # Execute pytest against the integration test directory:
+          # tests/integration/: Target only integration tests
+          # -v: Verbose output for detailed test results
+          # --tb=long: Full traceback on failures for debugging service interactions
+          # --junitxml=integration-results.xml: Generate JUnit XML for reporting
+          pytest tests/integration/ \
+            -v \
+            --tb=long \
+            --junitxml=integration-results.xml
+
+      # Step 5: Upload integration test results for analysis
+      - name: "Upload integration test results"
+        # Always upload, even on failure, to aid in debugging
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # Artifact name to distinguish from unit test results
+          name: integration-test-results
+          # Include the JUnit XML report
+          path: integration-results.xml
+          # Retain for 30 days
+          retention-days: 30
+
+  # =========================================================================
+  # STAGE 3: SECURITY - Security Scanning
+  # =========================================================================
+  # This job performs security analysis using multiple tools:
+  # - Bandit: Python-specific security vulnerability scanner
+  # - Safety: Checks dependencies for known security vulnerabilities
+  # - Trivy: Scans for vulnerabilities in dependencies and configs
+  # =========================================================================
+  security-scan:
+    # Display name for the security scanning job
+    name: "Stage 3 - Security Scan"
+    # Run on the latest Ubuntu runner
+    runs-on: ubuntu-latest
+    # Depends on both unit and integration tests passing
+    needs: [unit-tests, integration-tests]
+    # Security scans should complete within 15 minutes
+    timeout-minutes: 15
+
+    steps:
+      # Step 1: Check out the repository code for scanning
+      - name: "Checkout repository source code"
+        uses: actions/checkout@v4
+
+      # Step 2: Set up Python for running Python-based security tools
+      - name: "Set up Python ${{ env.PYTHON_VERSION }}"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "${{ env.PYTHON_VERSION }}"
+          cache: "pip"
+
+      # Step 3: Install security scanning tools
+      - name: "Install security scanning tools"
+        run: |
+          # Upgrade pip to latest
+          python -m pip install --upgrade pip
+          # Install Bandit for Python security analysis (finds common security issues)
+          # Install Safety for checking dependencies against vulnerability databases
+          pip install bandit safety
+          # Install project dependencies so Safety can check them for vulnerabilities
+          pip install -r requirements.txt || true
+
+      # Step 4: Run Bandit security scanner against the source code
+      - name: "Run Bandit security analysis"
+        run: |
+          # Execute Bandit to scan Python source code for security issues:
+          # -r src/: Recursively scan the src directory
+          # -f json: Output results in JSON format for machine parsing
+          # -o bandit-results.json: Write results to a file for artifact upload
+          # -ll: Only report issues of severity LOW or higher
+          # --confidence-level=LOW: Include findings with low confidence
+          # -x tests/: Exclude the tests directory from scanning
+          bandit -r src/ \
+            -f json \
+            -o bandit-results.json \
+            -ll \
+            --confidence-level=LOW \
+            -x tests/ || true
+          # Also output human-readable results to the console for quick review:
+          # -f txt: Text format for readable console output
+          bandit -r src/ -f txt -ll -x tests/ || true
+
+      # Step 5: Check installed Python packages for known security vulnerabilities
+      - name: "Run Safety dependency vulnerability check"
+        run: |
+          # Run Safety to check all installed packages against the vulnerability database.
+          # Safety checks PyPI packages for known CVEs and security advisories.
+          # --full-report: Show complete details for each vulnerability found
+          # || true: Don't fail the build on findings; they're reported for review
+          safety check --full-report || true
+
+      # Step 6: Run Trivy vulnerability scanner for comprehensive security analysis
+      - name: "Run Trivy vulnerability scanner"
+        uses: aquasecurity/trivy-action@master
+        with:
+          # Scan the filesystem (source code and configuration files)
+          scan-type: "fs"
+          # Scan the current directory (repository root)
+          scan-ref: "."
+          # Report vulnerabilities of CRITICAL and HIGH severity
+          severity: "CRITICAL,HIGH"
+          # Output results in table format for easy reading in CI logs
+          format: "table"
+          # Don't fail the build on findings; they are advisory
+          exit-code: "0"
+
+      # Step 7: Upload Bandit security scan results as an artifact
+      - name: "Upload security scan results"
+        # Always upload results regardless of scan outcome
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # Artifact name for security scan results
+          name: security-scan-results
+          # Include the JSON report from Bandit
+          path: bandit-results.json
+          # Retain for 90 days (security findings need longer retention)
+          retention-days: 90
+
+  # =========================================================================
+  # STAGE 4: DEPLOY - Docker Build and Push to ECR
+  # =========================================================================
+  # This job builds the production Docker image using the multi-stage
+  # Dockerfile, tags it with the commit SHA and 'latest', and pushes
+  # it to Amazon ECR. Only runs on pushes to main/dev (not on PRs).
+  # =========================================================================
+  docker-build-and-push:
+    # Display name for the Docker build job
+    name: "Stage 4 - Docker Build & Push to ECR"
+    # Run on the latest Ubuntu runner
+    runs-on: ubuntu-latest
+    # Depends on security scanning passing - enforces build->test->security->deploy order
+    needs: [security-scan]
+    # Only run on push events (not pull requests) to avoid pushing PR images to ECR
+    if: github.event_name == 'push'
+    # Docker builds can take time; allow up to 30 minutes
+    timeout-minutes: 30
+
+    # Permissions required for AWS authentication via OIDC (OpenID Connect)
+    permissions:
+      # Read repository contents for checkout
+      contents: read
+      # Write ID token for OIDC-based AWS authentication (no long-lived credentials)
+      id-token: write
+
+    steps:
+      # Step 1: Check out the repository code including the Dockerfile
+      - name: "Checkout repository source code"
+        uses: actions/checkout@v4
+
+      # Step 2: Configure AWS credentials using OIDC for secure, keyless authentication
+      - name: "Configure AWS credentials via OIDC"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # IAM role ARN that GitHub Actions assumes via OIDC federation
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          # AWS region for ECR operations
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Step 3: Authenticate Docker client with Amazon ECR registry
+      - name: "Login to Amazon ECR"
+        # This action gets an ECR auth token and configures Docker to use it
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Step 4: Set up Docker Buildx for advanced build features (multi-platform, caching)
+      - name: "Set up Docker Buildx"
+        uses: docker/setup-buildx-action@v3
+
+      # Step 5: Generate metadata (tags, labels) for the Docker image
+      - name: "Generate Docker image metadata"
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # Target the ECR repository for image naming
+          images: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}
+          # Define tagging strategy:
+          tags: |
+            # Tag with the full commit SHA for precise version tracking
+            type=sha,prefix=,format=long
+            # Tag with branch name for environment-based deployments
+            type=ref,event=branch
+            # Tag with 'latest' for the default pull tag
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      # Step 6: Build the Docker image and push to ECR
+      - name: "Build and push Docker image to ECR"
+        uses: docker/build-push-action@v5
+        with:
+          # Use the repository root as the build context
+          context: .
+          # Path to the production Dockerfile
+          file: ./deployment/docker/Dockerfile
+          # Push the built image to ECR (true since we're past the PR check)
+          push: true
+          # Apply the tags generated by the metadata step
+          tags: ${{ steps.meta.outputs.tags }}
+          # Apply OCI labels generated by the metadata step
+          labels: ${{ steps.meta.outputs.labels }}
+          # Enable GitHub Actions cache for Docker layers to speed up subsequent builds
+          cache-from: type=gha
+          # Export layers to GitHub Actions cache for future builds
+          cache-to: type=gha,mode=max
+          # Build arguments passed to the Dockerfile for build-time configuration
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ github.ref_name }}
+
+      # Step 7: Output the pushed image details for downstream jobs and audit trail
+      - name: "Output image details"
+        run: |
+          # Print the image URI with SHA tag for deployment reference
+          echo "Image pushed: ${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}"
+          # Print all tags applied to the image for verification
+          echo "Tags: ${{ steps.meta.outputs.tags }}"
+
+  # =========================================================================
+  # NOTIFICATION: Report CI Pipeline Status
+  # =========================================================================
+  # This job sends notifications about the pipeline outcome to Slack.
+  # It runs after all other jobs complete, regardless of their status.
+  # =========================================================================
+  notify:
+    # Display name for the notification job
+    name: "Notify - Pipeline Status"
+    # Run on the latest Ubuntu runner
+    runs-on: ubuntu-latest
+    # Run after all pipeline stages complete
+    needs: [lint, type-check, unit-tests, integration-tests, security-scan, docker-build-and-push]
+    # Always run this job, even if previous jobs failed, to send failure notifications
+    if: always()
+    # Notification should complete quickly
+    timeout-minutes: 5
+
+    steps:
+      # Step 1: Send Slack notification with pipeline results
+      - name: "Send Slack notification"
+        uses: slackapi/slack-github-action@v1.25.0
+        with:
+          # Slack channel ID where notifications should be posted
+          channel-id: ${{ secrets.SLACK_CHANNEL_ID }}
+          # Compose a message with the pipeline status, branch, and commit info
+          slack-message: |
+            *ECTP CI Pipeline ${{ needs.docker-build-and-push.result == 'success' && 'PASSED' || 'FAILED' }}*
+            Branch: `${{ github.ref_name }}`
+            Commit: `${{ github.sha }}`
+            Author: ${{ github.actor }}
+            Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        # Slack bot token for authentication
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}

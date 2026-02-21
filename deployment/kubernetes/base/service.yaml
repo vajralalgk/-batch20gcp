@@ -1,0 +1,123 @@
+# =============================================================================
+# Enterprise Cloud Transformation Platform (ECTP) - Kubernetes Service Manifest
+# =============================================================================
+# Author: Gopi Krishna Vajrala
+# Description: Kubernetes Service manifest for the ECTP FastAPI API.
+#              A Service provides a stable network endpoint (ClusterIP) that
+#              load-balances traffic across all healthy ECTP API pods.
+#              This Service is the internal entry point for the ECTP API,
+#              typically fronted by an Ingress or AWS ALB for external access.
+#
+# Apply: kubectl apply -f service.yaml
+# Or via Kustomize: kubectl apply -k deployment/kubernetes/base/
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# apiVersion: Specifies the Kubernetes API version for Service resources.
+# v1 is the core API group where Service resources are defined.
+# ---------------------------------------------------------------------------
+apiVersion: v1
+
+# ---------------------------------------------------------------------------
+# kind: The type of Kubernetes resource being defined.
+# A Service provides a stable network endpoint that routes traffic to
+# a set of pods selected by label selectors. It acts as an internal
+# load balancer within the Kubernetes cluster.
+# ---------------------------------------------------------------------------
+kind: Service
+
+# ---------------------------------------------------------------------------
+# metadata: Information that uniquely identifies this Service resource.
+# Labels and annotations follow Kubernetes recommended conventions.
+# ---------------------------------------------------------------------------
+metadata:
+  # Name of the Service resource, used as the DNS hostname within the cluster.
+  # Other services can reach this Service at: ectp-api.ectp.svc.cluster.local
+  name: ectp-api
+  # Namespace where this Service will be created (must match the Deployment namespace)
+  namespace: ectp
+  # Labels applied to the Service resource for organization and selection
+  labels:
+    # Application name label following Kubernetes recommended conventions
+    app.kubernetes.io/name: ectp-api
+    # Component label identifying this as the API component
+    app.kubernetes.io/component: api
+    # Part-of label indicating this belongs to the ECTP platform
+    app.kubernetes.io/part-of: ectp
+    # Managed-by label indicating Kustomize manages this resource
+    app.kubernetes.io/managed-by: kustomize
+  # Annotations provide additional metadata for tools, monitoring, and documentation
+  annotations:
+    # Description of this Service for documentation purposes
+    app.kubernetes.io/description: "ECTP API Service - Routes traffic to ECTP FastAPI pods"
+    # Team responsible for this Service resource
+    team: "ectp-platform"
+    # Contact for the owning team
+    contact: "ectp-platform@example.com"
+    # Prometheus annotation to enable service-level metric discovery
+    prometheus.io/scrape: "true"
+    # Port where Prometheus can scrape metrics through this Service
+    prometheus.io/port: "8000"
+
+# ---------------------------------------------------------------------------
+# spec: The desired state specification for the Service.
+# Defines the service type, port mapping, and pod selection criteria.
+# ---------------------------------------------------------------------------
+spec:
+  # ---------------------------------------------------------------------------
+  # type: The type of Service determines how it is exposed.
+  #
+  # ClusterIP (default): Exposes the Service on an internal cluster IP.
+  #   - Only reachable from within the cluster
+  #   - Used when external access is provided via Ingress or AWS ALB Ingress Controller
+  #   - Most secure option as it's not directly exposed to the internet
+  #
+  # Other options (not used here):
+  #   - NodePort: Exposes on each node's IP at a static port (30000-32767)
+  #   - LoadBalancer: Provisions an external cloud load balancer (AWS NLB/ALB)
+  # ---------------------------------------------------------------------------
+  type: ClusterIP
+
+  # ---------------------------------------------------------------------------
+  # selector: Label selector that identifies which pods receive traffic.
+  # The Service routes traffic ONLY to pods matching ALL of these labels.
+  # These labels MUST match the labels on the pods created by the Deployment.
+  # ---------------------------------------------------------------------------
+  selector:
+    # Select pods with the ectp-api application name label
+    # This matches the label in the Deployment's pod template
+    app.kubernetes.io/name: ectp-api
+    # Select pods with the api component label
+    # This ensures only API pods receive traffic (not worker pods, if any)
+    app.kubernetes.io/component: api
+
+  # ---------------------------------------------------------------------------
+  # ports: Port mapping configuration for the Service.
+  # Defines how incoming traffic on the Service port is forwarded to pod ports.
+  # ---------------------------------------------------------------------------
+  ports:
+    # HTTP port configuration for the ECTP API
+    - name: http
+      # name: Human-readable name for this port mapping, used by Ingress resources
+      #       and other Services that reference this port by name instead of number
+      protocol: TCP
+      # protocol: Network protocol (TCP is standard for HTTP traffic)
+      port: 80
+      # port: The port number exposed by the Service within the cluster.
+      # Other services and Ingress resources connect to this port.
+      # Using port 80 (standard HTTP) simplifies Ingress and client configuration.
+      targetPort: http
+      # targetPort: The port on the pod to forward traffic to.
+      # Using the named port 'http' (defined in the Deployment's container ports)
+      # instead of a number makes the configuration resilient to port changes.
+      # If the Deployment changes the container port, only the Deployment needs updating.
+
+  # ---------------------------------------------------------------------------
+  # sessionAffinity: Controls whether traffic from a client is always routed
+  # to the same pod. 'None' means round-robin load balancing across all pods.
+  #
+  # For stateless APIs like ECTP (which store session state in Redis),
+  # 'None' is preferred as it provides the best load distribution.
+  # Use 'ClientIP' only if the application requires sticky sessions.
+  # ---------------------------------------------------------------------------
+  sessionAffinity: None

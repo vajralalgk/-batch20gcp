@@ -1,0 +1,226 @@
+# ============================================================================
+# Enterprise Cloud Transformation Platform (ECTP) - Alert Rules
+# Author: Gopi Krishna Vajrala
+# ============================================================================
+# These alert rules define when notifications should be sent to the
+# operations team. Each alert maps to a specific SLA metric.
+# ============================================================================
+
+alerts:
+  # --- API Health Alerts ---
+
+  - name: api_high_error_rate
+    description: "API error rate exceeds 0.5% threshold"
+    # WHY: Error rate above 0.5% indicates a systemic issue affecting users.
+    # Normal error rate should be < 0.1% (mostly 404s from bad client requests).
+    metric: ECTP/ErrorRate
+    threshold: 0.5
+    comparison: GreaterThanThreshold
+    period_seconds: 300  # 5-minute evaluation window
+    evaluation_periods: 2  # Must breach for 2 consecutive periods
+    severity: P1_CRITICAL
+    notification:
+      - sns_topic: ectp-alerts-critical
+      - pagerduty: true
+    runbook: "docs/runbooks/high-error-rate.md"
+
+  - name: api_high_latency
+    description: "API p99 latency exceeds 1 second"
+    # WHY: Users perceive latency above 1 second as "slow".
+    # Registration pages must load in under 500ms for good UX.
+    metric: ECTP/Latency_p99
+    threshold: 1000  # milliseconds
+    comparison: GreaterThanThreshold
+    period_seconds: 300
+    evaluation_periods: 3
+    severity: P2_HIGH
+    notification:
+      - sns_topic: ectp-alerts-high
+    runbook: "docs/runbooks/high-latency.md"
+
+  - name: api_availability_low
+    description: "API availability drops below 99.9%"
+    # WHY: SLO target is 99.95%. Alert at 99.9% gives time to react
+    # before breaching the SLO.
+    metric: ECTP/Availability
+    threshold: 99.9
+    comparison: LessThanThreshold
+    period_seconds: 3600  # 1-hour window
+    evaluation_periods: 1
+    severity: P1_CRITICAL
+    notification:
+      - sns_topic: ectp-alerts-critical
+      - pagerduty: true
+    runbook: "docs/runbooks/low-availability.md"
+
+  # --- Database Alerts ---
+
+  - name: rds_cpu_high
+    description: "RDS CPU utilization exceeds 80%"
+    # WHY: CPU above 80% causes query slowdowns and potential timeouts.
+    # At 90%, the database may start rejecting connections.
+    metric: AWS/RDS/CPUUtilization
+    threshold: 80
+    comparison: GreaterThanThreshold
+    period_seconds: 300
+    evaluation_periods: 3
+    severity: P2_HIGH
+    notification:
+      - sns_topic: ectp-alerts-high
+    runbook: "docs/runbooks/rds-high-cpu.md"
+
+  - name: rds_storage_low
+    description: "RDS free storage below 10GB"
+    # WHY: Running out of database storage causes immediate outage.
+    # 10GB buffer gives approximately 24-48 hours to respond.
+    metric: AWS/RDS/FreeStorageSpace
+    threshold: 10737418240  # 10GB in bytes
+    comparison: LessThanThreshold
+    period_seconds: 3600
+    evaluation_periods: 1
+    severity: P1_CRITICAL
+    notification:
+      - sns_topic: ectp-alerts-critical
+    runbook: "docs/runbooks/rds-low-storage.md"
+
+  - name: rds_connections_high
+    description: "RDS connection count exceeds 80% of maximum"
+    # WHY: Running out of database connections causes application errors.
+    # Connection pool exhaustion is a common production issue.
+    metric: AWS/RDS/DatabaseConnections
+    threshold: 80  # percent of max_connections
+    comparison: GreaterThanThreshold
+    period_seconds: 300
+    evaluation_periods: 2
+    severity: P2_HIGH
+    notification:
+      - sns_topic: ectp-alerts-high
+    runbook: "docs/runbooks/rds-connection-exhaustion.md"
+
+  # --- Cost Alerts ---
+
+  - name: cost_anomaly_detected
+    description: "Daily cost exceeds 20% of expected baseline"
+    # WHY: Unexpected cost spikes often indicate:
+    # - Runaway auto-scaling
+    # - Data transfer anomalies
+    # - Unintended resource provisioning
+    # - Possible security breach (crypto mining)
+    metric: ECTP/DailyCostAnomaly
+    threshold: 20  # percent above baseline
+    comparison: GreaterThanThreshold
+    period_seconds: 86400  # Daily
+    evaluation_periods: 1
+    severity: P3_MODERATE
+    notification:
+      - sns_topic: ectp-alerts-cost
+      - email: cloud-finops@university.edu
+    runbook: "docs/runbooks/cost-anomaly.md"
+
+  - name: budget_80_percent
+    description: "Monthly budget usage exceeds 80%"
+    # WHY: At 80%, there's time to investigate and optimize before
+    # exceeding 100%. This gives ~6 days of runway at linear spend.
+    metric: AWS/Billing/EstimatedCharges
+    threshold: 80  # percent of monthly budget
+    comparison: GreaterThanThreshold
+    period_seconds: 86400
+    evaluation_periods: 1
+    severity: P3_MODERATE
+    notification:
+      - sns_topic: ectp-alerts-cost
+    runbook: "docs/runbooks/budget-threshold.md"
+
+  # --- Integration Alerts ---
+
+  - name: servicenow_integration_failure
+    description: "ServiceNow API calls failing for 5+ minutes"
+    # WHY: ServiceNow integration failure means incidents aren't being
+    # created automatically, which could mask critical issues.
+    metric: ECTP/ServiceNow/ErrorRate
+    threshold: 50  # percent of calls failing
+    comparison: GreaterThanThreshold
+    period_seconds: 300
+    evaluation_periods: 1
+    severity: P2_HIGH
+    notification:
+      - sns_topic: ectp-alerts-high
+    runbook: "docs/runbooks/servicenow-integration-failure.md"
+
+  - name: ellucian_sync_failure
+    description: "Ellucian data sync has not completed in 24 hours"
+    # WHY: Stale data from Ellucian affects enrollment-based scaling
+    # decisions and could cause capacity issues during registration.
+    metric: ECTP/Ellucian/LastSyncAge
+    threshold: 86400  # 24 hours in seconds
+    comparison: GreaterThanThreshold
+    period_seconds: 3600
+    evaluation_periods: 1
+    severity: P2_HIGH
+    notification:
+      - sns_topic: ectp-alerts-high
+    runbook: "docs/runbooks/ellucian-sync-failure.md"
+
+  # --- Security Alerts ---
+
+  - name: security_finding_critical
+    description: "Critical security finding detected by GuardDuty or Security Hub"
+    # WHY: Critical security findings require immediate investigation.
+    # Could indicate active compromise, data exfiltration, or policy violation.
+    metric: ECTP/Security/CriticalFindings
+    threshold: 0
+    comparison: GreaterThanThreshold
+    period_seconds: 60  # Check every minute
+    evaluation_periods: 1
+    severity: P1_CRITICAL
+    notification:
+      - sns_topic: ectp-alerts-security
+      - pagerduty: true
+      - email: security-team@university.edu
+    runbook: "docs/runbooks/security-incident-response.md"
+
+# ============================================================================
+# Notification Channels
+# ============================================================================
+notification_channels:
+  sns_topics:
+    - name: ectp-alerts-critical
+      subscribers:
+        - type: email
+          endpoint: cloud-ops-critical@university.edu
+        - type: sms
+          endpoint: "+1-555-0100"
+
+    - name: ectp-alerts-high
+      subscribers:
+        - type: email
+          endpoint: cloud-ops@university.edu
+
+    - name: ectp-alerts-cost
+      subscribers:
+        - type: email
+          endpoint: cloud-finops@university.edu
+
+    - name: ectp-alerts-security
+      subscribers:
+        - type: email
+          endpoint: security-team@university.edu
+        - type: sms
+          endpoint: "+1-555-0200"
+
+# ============================================================================
+# Escalation Policy
+# ============================================================================
+escalation:
+  P1_CRITICAL:
+    initial_response: 15_minutes
+    escalation_after: 30_minutes
+    escalate_to: "VP of IT"
+  P2_HIGH:
+    initial_response: 30_minutes
+    escalation_after: 2_hours
+    escalate_to: "IT Director"
+  P3_MODERATE:
+    initial_response: 4_hours
+    escalation_after: 24_hours
+    escalate_to: "Cloud Operations Manager"
