@@ -1,226 +1,369 @@
 # ============================================================================
-# Enterprise Cloud Transformation Platform (ECTP) - Alert Rules
-# Author: Gopi Krishna Vajrala
+# Netflix Real-Time LLM Personalization & Inference Platform - Alert Rules
+# Prometheus Alerting Rules for GPU Inference Monitoring
 # ============================================================================
-# These alert rules define when notifications should be sent to the
-# operations team. Each alert maps to a specific SLA metric.
+# These rules define alerting conditions for the LLM inference platform
+# covering performance, GPU health, KV cache, cost, and availability.
 # ============================================================================
 
-alerts:
-  # --- API Health Alerts ---
+groups:
+  # ==========================================================================
+  # Group: Inference Performance
+  # Monitors latency SLOs, error rates, and request queuing health.
+  # ==========================================================================
+  - name: inference_performance
+    interval: 15s
+    rules:
+      - alert: HighP95Latency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(netflix_llm_inference_latency_seconds_bucket[5m])) by (le, region, model_version)
+          ) * 1000 > 200
+        for: 5m
+        labels:
+          severity: critical
+          team: llm-inference
+          slo: latency
+        annotations:
+          summary: "p95 inference latency exceeds 200ms SLO"
+          description: >-
+            p95 inference latency in region {{ $labels.region }} for model
+            {{ $labels.model_version }} is {{ $value | printf "%.1f" }}ms,
+            exceeding the 200ms SLO target. This impacts real-time
+            personalization quality and user experience.
+          runbook_url: "https://wiki.netflix.internal/runbooks/llm-platform/high-p95-latency"
+          dashboard_url: "https://grafana.netflix.internal/d/netflix-llm-gpu-inference"
 
-  - name: api_high_error_rate
-    description: "API error rate exceeds 0.5% threshold"
-    # WHY: Error rate above 0.5% indicates a systemic issue affecting users.
-    # Normal error rate should be < 0.1% (mostly 404s from bad client requests).
-    metric: ECTP/ErrorRate
-    threshold: 0.5
-    comparison: GreaterThanThreshold
-    period_seconds: 300  # 5-minute evaluation window
-    evaluation_periods: 2  # Must breach for 2 consecutive periods
-    severity: P1_CRITICAL
-    notification:
-      - sns_topic: ectp-alerts-critical
-      - pagerduty: true
-    runbook: "docs/runbooks/high-error-rate.md"
+      - alert: HighP99Latency
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(netflix_llm_inference_latency_seconds_bucket[5m])) by (le, region, model_version)
+          ) * 1000 > 250
+        for: 5m
+        labels:
+          severity: critical
+          team: llm-inference
+          slo: latency
+        annotations:
+          summary: "p99 inference latency exceeds 250ms SLO"
+          description: >-
+            p99 inference latency in region {{ $labels.region }} for model
+            {{ $labels.model_version }} is {{ $value | printf "%.1f" }}ms,
+            exceeding the 250ms SLO target. Tail latency degradation may
+            indicate GPU memory pressure, KV cache thrashing, or batch
+            scheduling issues.
+          runbook_url: "https://wiki.netflix.internal/runbooks/llm-platform/high-p99-latency"
+          dashboard_url: "https://grafana.netflix.internal/d/netflix-llm-gpu-inference"
 
-  - name: api_high_latency
-    description: "API p99 latency exceeds 1 second"
-    # WHY: Users perceive latency above 1 second as "slow".
-    # Registration pages must load in under 500ms for good UX.
-    metric: ECTP/Latency_p99
-    threshold: 1000  # milliseconds
-    comparison: GreaterThanThreshold
-    period_seconds: 300
-    evaluation_periods: 3
-    severity: P2_HIGH
-    notification:
-      - sns_topic: ectp-alerts-high
-    runbook: "docs/runbooks/high-latency.md"
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(netflix_llm_inference_requests_total{status=~"5..|error|timeout"}[5m])) by (region, model_version)
+            /
+            sum(rate(netflix_llm_inference_requests_total[5m])) by (region, model_version)
+          ) * 100 > 1
+        for: 5m
+        labels:
+          severity: critical
+          team: llm-inference
+          slo: availability
+        annotations:
+          summary: "Inference error rate exceeds 1% threshold"
+          description: >-
+            Error rate in region {{ $labels.region }} for model
+            {{ $labels.model_version }} is {{ $value | printf "%.2f" }}%,
+            exceeding the 1% threshold. Check for OOM errors, model loading
+            failures, or upstream dependency issues.
+          runbook_url: "https://wiki.netflix.internal/runbooks/llm-platform/high-error-rate"
+          dashboard_url: "https://grafana.netflix.internal/d/netflix-llm-gpu-inference"
 
-  - name: api_availability_low
-    description: "API availability drops below 99.9%"
-    # WHY: SLO target is 99.95%. Alert at 99.9% gives time to react
-    # before breaching the SLO.
-    metric: ECTP/Availability
-    threshold: 99.9
-    comparison: LessThanThreshold
-    period_seconds: 3600  # 1-hour window
-    evaluation_periods: 1
-    severity: P1_CRITICAL
-    notification:
-      - sns_topic: ectp-alerts-critical
-      - pagerduty: true
-    runbook: "docs/runbooks/low-availability.md"
+      - alert: InferenceQueueBacklog
+        expr: |
+          netflix_llm_inference_queue_depth{} > 100
+        for: 2m
+        labels:
+          severity: warning
+          team: llm-inference
+        annotations:
+          summary: "Inference request queue depth exceeds 100"
+          description: >-
+            Queue depth in region {{ $labels.region }} is {{ $value }},
+            indicating insufficient serving capacity. Requests are waiting
+            longer than expected for GPU execution slots. Consider scaling
+            up inference workers or investigating slow requests.
+          runbook_url: "https://wiki.netflix.internal/runbooks/llm-platform/queue-backlog"
+          dashboard_url: "https://grafana.netflix.internal/d/netflix-llm-gpu-inference"
 
-  # --- Database Alerts ---
+  # ==========================================================================
+  # Group: GPU Health
+  # Monitors GPU utilization, memory, temperature, and hardware errors.
+  # ==========================================================================
+  - name: gpu_health
+    interval: 15s
+    rules:
+      - alert: LowGPUUtilization
+        expr: |
+          avg(DCGM_FI_DEV_GPU_UTIL{}) by (region, instance, gpu) < 40
+        for: 10m
+        labels:
+          severity: warning
+          team: llm-infrastructure
+        annotations:
+          summary: "GPU utilization below 40% - potential waste"
+          description: >-
+            GPU {{ $labels.gpu }} on {{ $labels.instance }} in region
+            {{ $labels.region }} has utilization at {{ $value | printf "%.1f" }}%
+            for over 10 minutes. This indicates wasted GPU capacity. Consider
+            consolidating workloads or scaling down the inference fleet.
+          runbook_url: "https://wiki.netflix.internal/runbooks/llm-platform/low-gpu-utilization"
 
-  - name: rds_cpu_high
-    description: "RDS CPU utilization exceeds 80%"
-    # WHY: CPU above 80% causes query slowdowns and potential timeouts.
-    # At 90%, the database may start rejecting connections.
-    metric: AWS/RDS/CPUUtilization
-    threshold: 80
-    comparison: GreaterThanThreshold
-    period_seconds: 300
-    evaluation_periods: 3
-    severity: P2_HIGH
-    notification:
-      - sns_topic: ectp-alerts-high
-    runbook: "docs/runbooks/rds-high-cpu.md"
+      - alert: HighGPUUtilization
+        expr: |
+          avg(DCGM_FI_DEV_GPU_UTIL{}) by (region, instance, gpu) > 95
+        for: 5m
+        labels:
+          severity: warning
+          team: llm-infrastructure
+        annotations:
+          summary: "GPU utilization above 95% - capacity saturation"
+          description: >-
+            GPU {{ $labels.gpu }} on {{ $labels.instance }} in region
+            {{ $labels.region }} has utilization at {{ $value | printf "%.1f" }}%
+            sustained for 5 minutes. The GPU is near saturation which will
+            cause latency degradation and queue buildup. Scale up inference
+            workers or enable cross-region spillover.
+          runbook_url: "https://wiki.netflix.internal/runbooks/llm-platform/high-gpu-utilization"
 
-  - name: rds_storage_low
-    description: "RDS free storage below 10GB"
-    # WHY: Running out of database storage causes immediate outage.
-    # 10GB buffer gives approximately 24-48 hours to respond.
-    metric: AWS/RDS/FreeStorageSpace
-    threshold: 10737418240  # 10GB in bytes
-    comparison: LessThanThreshold
-    period_seconds: 3600
-    evaluation_periods: 1
-    severity: P1_CRITICAL
-    notification:
-      - sns_topic: ectp-alerts-critical
-    runbook: "docs/runbooks/rds-low-storage.md"
+      - alert: GPUMemoryPressure
+        expr: |
+          (DCGM_FI_DEV_FB_USED{} / DCGM_FI_DEV_FB_TOTAL{}) * 100 > 90
+        for: 5m
+        labels:
+          severity: critical
+          team: llm-infrastructure
+        annotations:
+          summary: "GPU memory usage exceeds 90%"
+          description: >-
+            GPU {{ $labels.gpu }} on {{ $labels.instance }} in region
+            {{ $labels.region }} has {{ $value | printf "%.1f" }}% memory
+            utilization. At this level, OOM errors become likely, KV cache
+            eviction increases dramatically, and new requests may be rejected.
+            Immediate action required.
+          runbook_url: "https://wiki.netflix.internal/runbooks/llm-platform/gpu-memory-pressure"
 
-  - name: rds_connections_high
-    description: "RDS connection count exceeds 80% of maximum"
-    # WHY: Running out of database connections causes application errors.
-    # Connection pool exhaustion is a common production issue.
-    metric: AWS/RDS/DatabaseConnections
-    threshold: 80  # percent of max_connections
-    comparison: GreaterThanThreshold
-    period_seconds: 300
-    evaluation_periods: 2
-    severity: P2_HIGH
-    notification:
-      - sns_topic: ectp-alerts-high
-    runbook: "docs/runbooks/rds-connection-exhaustion.md"
+      - alert: GPUTemperatureHigh
+        expr: |
+          DCGM_FI_DEV_GPU_TEMP{} > 85
+        for: 2m
+        labels:
+          severity: critical
+          team: llm-infrastructure
+        annotations:
+          summary: "GPU temperature exceeds 85 degrees Celsius"
+          description: >-
+            GPU {{ $labels.gpu }} on {{ $labels.instance }} in region
+            {{ $labels.region }} is at {{ $value }}C. Temperatures above 85C
+            trigger thermal throttling which severely degrades inference
+            performance. At 90C+ the GPU may shut down. Check datacenter
+            cooling and GPU fan status.
+          runbook_url: "https://wiki.netflix.internal/runbooks/llm-platform/gpu-temperature-high"
 
-  # --- Cost Alerts ---
+      - alert: GPUECCErrors
+        expr: |
+          increase(DCGM_FI_DEV_ECC_DBE_VOL_TOTAL{}[5m]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          team: llm-infrastructure
+          page: "true"
+        annotations:
+          summary: "Uncorrectable GPU ECC errors detected"
+          description: >-
+            GPU {{ $labels.gpu }} on {{ $labels.instance }} in region
+            {{ $labels.region }} has reported {{ $value }} uncorrectable
+            (double-bit) ECC errors in the last 5 minutes. Uncorrectable ECC
+            errors indicate failing GPU memory and can cause silent data
+            corruption in model weights or KV cache. The GPU should be drained
+            and replaced immediately.
+          runbook_url: "https://wiki.netflix.internal/runbooks/llm-platform/gpu-ecc-errors"
 
-  - name: cost_anomaly_detected
-    description: "Daily cost exceeds 20% of expected baseline"
-    # WHY: Unexpected cost spikes often indicate:
-    # - Runaway auto-scaling
-    # - Data transfer anomalies
-    # - Unintended resource provisioning
-    # - Possible security breach (crypto mining)
-    metric: ECTP/DailyCostAnomaly
-    threshold: 20  # percent above baseline
-    comparison: GreaterThanThreshold
-    period_seconds: 86400  # Daily
-    evaluation_periods: 1
-    severity: P3_MODERATE
-    notification:
-      - sns_topic: ectp-alerts-cost
-      - email: cloud-finops@university.edu
-    runbook: "docs/runbooks/cost-anomaly.md"
+  # ==========================================================================
+  # Group: KV Cache
+  # Monitors KV cache utilization, eviction rates, and fragmentation.
+  # ==========================================================================
+  - name: kv_cache
+    interval: 15s
+    rules:
+      - alert: KVCacheNearFull
+        expr: |
+          (netflix_llm_kv_cache_used_blocks{} / netflix_llm_kv_cache_total_blocks{}) * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+          team: llm-inference
+        annotations:
+          summary: "KV cache utilization exceeds 90%"
+          description: >-
+            KV cache in region {{ $labels.region }} is at
+            {{ $value | printf "%.1f" }}% utilization. Near-full cache causes
+            aggressive eviction of cached key-value pairs, increasing
+            recomputation overhead and degrading latency. Consider increasing
+            cache allocation or reducing max sequence length.
+          runbook_url: "https://wiki.netflix.internal/runbooks/llm-platform/kv-cache-near-full"
 
-  - name: budget_80_percent
-    description: "Monthly budget usage exceeds 80%"
-    # WHY: At 80%, there's time to investigate and optimize before
-    # exceeding 100%. This gives ~6 days of runway at linear spend.
-    metric: AWS/Billing/EstimatedCharges
-    threshold: 80  # percent of monthly budget
-    comparison: GreaterThanThreshold
-    period_seconds: 86400
-    evaluation_periods: 1
-    severity: P3_MODERATE
-    notification:
-      - sns_topic: ectp-alerts-cost
-    runbook: "docs/runbooks/budget-threshold.md"
+      - alert: HighEvictionRate
+        expr: |
+          rate(netflix_llm_kv_cache_evictions_total{}[5m]) > 1000
+        for: 5m
+        labels:
+          severity: warning
+          team: llm-inference
+        annotations:
+          summary: "KV cache eviction rate exceeds 1000/s"
+          description: >-
+            KV cache eviction rate in region {{ $labels.region }} is
+            {{ $value | printf "%.0f" }}/s. High eviction rates indicate the
+            cache is too small for the current workload, causing repeated
+            recomputation of evicted key-value pairs. This directly increases
+            time-to-first-token latency.
+          runbook_url: "https://wiki.netflix.internal/runbooks/llm-platform/high-eviction-rate"
 
-  # --- Integration Alerts ---
+      - alert: HighFragmentation
+        expr: |
+          netflix_llm_kv_cache_fragmentation_ratio{} * 100 > 30
+        for: 10m
+        labels:
+          severity: warning
+          team: llm-inference
+        annotations:
+          summary: "KV cache fragmentation exceeds 30%"
+          description: >-
+            KV cache fragmentation in region {{ $labels.region }} is at
+            {{ $value | printf "%.1f" }}%. High fragmentation reduces effective
+            cache capacity and increases allocation latency. A cache
+            defragmentation or restart of the inference worker may be needed.
+          runbook_url: "https://wiki.netflix.internal/runbooks/llm-platform/high-fragmentation"
 
-  - name: servicenow_integration_failure
-    description: "ServiceNow API calls failing for 5+ minutes"
-    # WHY: ServiceNow integration failure means incidents aren't being
-    # created automatically, which could mask critical issues.
-    metric: ECTP/ServiceNow/ErrorRate
-    threshold: 50  # percent of calls failing
-    comparison: GreaterThanThreshold
-    period_seconds: 300
-    evaluation_periods: 1
-    severity: P2_HIGH
-    notification:
-      - sns_topic: ectp-alerts-high
-    runbook: "docs/runbooks/servicenow-integration-failure.md"
+  # ==========================================================================
+  # Group: Cost
+  # Monitors GPU spending against budgets and cost anomalies.
+  # ==========================================================================
+  - name: cost
+    interval: 60s
+    rules:
+      - alert: BudgetThreshold75
+        expr: |
+          (netflix_llm_monthly_spend_actual{} / netflix_llm_monthly_budget{}) * 100 > 75
+        for: 0m
+        labels:
+          severity: warning
+          team: llm-finops
+        annotations:
+          summary: "GPU spend exceeds 75% of monthly budget"
+          description: >-
+            Month-to-date GPU spend in region {{ $labels.region }} has reached
+            {{ $value | printf "%.1f" }}% of the allocated monthly budget.
+            Review spending trends and consider optimization measures if spend
+            is ahead of the expected linear burn rate.
+          runbook_url: "https://wiki.netflix.internal/runbooks/llm-platform/budget-threshold"
 
-  - name: ellucian_sync_failure
-    description: "Ellucian data sync has not completed in 24 hours"
-    # WHY: Stale data from Ellucian affects enrollment-based scaling
-    # decisions and could cause capacity issues during registration.
-    metric: ECTP/Ellucian/LastSyncAge
-    threshold: 86400  # 24 hours in seconds
-    comparison: GreaterThanThreshold
-    period_seconds: 3600
-    evaluation_periods: 1
-    severity: P2_HIGH
-    notification:
-      - sns_topic: ectp-alerts-high
-    runbook: "docs/runbooks/ellucian-sync-failure.md"
+      - alert: BudgetThreshold90
+        expr: |
+          (netflix_llm_monthly_spend_actual{} / netflix_llm_monthly_budget{}) * 100 > 90
+        for: 0m
+        labels:
+          severity: critical
+          team: llm-finops
+          page: "true"
+        annotations:
+          summary: "GPU spend exceeds 90% of monthly budget"
+          description: >-
+            Month-to-date GPU spend in region {{ $labels.region }} has reached
+            {{ $value | printf "%.1f" }}% of the allocated monthly budget.
+            Immediate action required to prevent budget overrun. Consider
+            scaling down non-critical inference workloads or shifting traffic
+            to more cost-efficient SKUs.
+          runbook_url: "https://wiki.netflix.internal/runbooks/llm-platform/budget-threshold-critical"
 
-  # --- Security Alerts ---
+      - alert: CostPerTokenSpike
+        expr: |
+          netflix_llm_cost_per_1k_tokens{}
+          >
+          2 * avg_over_time(netflix_llm_cost_per_1k_tokens{}[7d])
+        for: 30m
+        labels:
+          severity: warning
+          team: llm-finops
+        annotations:
+          summary: "Cost per token is 2x above 7-day baseline"
+          description: >-
+            Cost per 1k tokens in region {{ $labels.region }} for SKU
+            {{ $labels.gpu_sku }} is {{ $value | printf "%.4f" }} USD, which is
+            more than 2x the 7-day average baseline. This may indicate
+            degraded batching efficiency, model regression, or infrastructure
+            issues causing lower throughput at the same cost.
+          runbook_url: "https://wiki.netflix.internal/runbooks/llm-platform/cost-per-token-spike"
 
-  - name: security_finding_critical
-    description: "Critical security finding detected by GuardDuty or Security Hub"
-    # WHY: Critical security findings require immediate investigation.
-    # Could indicate active compromise, data exfiltration, or policy violation.
-    metric: ECTP/Security/CriticalFindings
-    threshold: 0
-    comparison: GreaterThanThreshold
-    period_seconds: 60  # Check every minute
-    evaluation_periods: 1
-    severity: P1_CRITICAL
-    notification:
-      - sns_topic: ectp-alerts-security
-      - pagerduty: true
-      - email: security-team@university.edu
-    runbook: "docs/runbooks/security-incident-response.md"
+  # ==========================================================================
+  # Group: Availability
+  # Monitors regional health, SLA compliance, and failover events.
+  # ==========================================================================
+  - name: availability
+    interval: 15s
+    rules:
+      - alert: RegionDown
+        expr: |
+          netflix_llm_region_health{} == 0
+        for: 1m
+        labels:
+          severity: critical
+          team: llm-infrastructure
+          page: "true"
+        annotations:
+          summary: "Region health check failing - region may be down"
+          description: >-
+            Health check for region {{ $labels.region }} has been failing for
+            over 1 minute. If this persists, automatic failover will redirect
+            traffic to healthy regions. Investigate regional infrastructure,
+            GPU cluster health, and network connectivity immediately.
+          runbook_url: "https://wiki.netflix.internal/runbooks/llm-platform/region-down"
 
-# ============================================================================
-# Notification Channels
-# ============================================================================
-notification_channels:
-  sns_topics:
-    - name: ectp-alerts-critical
-      subscribers:
-        - type: email
-          endpoint: cloud-ops-critical@university.edu
-        - type: sms
-          endpoint: "+1-555-0100"
+      - alert: SLAViolation
+        expr: |
+          (
+            sum(rate(netflix_llm_inference_requests_total{status="200"}[1h])) by (region)
+            /
+            sum(rate(netflix_llm_inference_requests_total[1h])) by (region)
+          ) * 100 < 99.95
+        for: 0m
+        labels:
+          severity: critical
+          team: llm-inference
+          page: "true"
+          slo: availability
+        annotations:
+          summary: "Availability below 99.95% SLA over the last hour"
+          description: >-
+            Region {{ $labels.region }} availability over the past hour is
+            {{ $value | printf "%.3f" }}%, which is below the 99.95% SLA
+            target. This is actively consuming the error budget. Immediately
+            investigate error sources and consider traffic shifting to
+            healthier regions.
+          runbook_url: "https://wiki.netflix.internal/runbooks/llm-platform/sla-violation"
 
-    - name: ectp-alerts-high
-      subscribers:
-        - type: email
-          endpoint: cloud-ops@university.edu
-
-    - name: ectp-alerts-cost
-      subscribers:
-        - type: email
-          endpoint: cloud-finops@university.edu
-
-    - name: ectp-alerts-security
-      subscribers:
-        - type: email
-          endpoint: security-team@university.edu
-        - type: sms
-          endpoint: "+1-555-0200"
-
-# ============================================================================
-# Escalation Policy
-# ============================================================================
-escalation:
-  P1_CRITICAL:
-    initial_response: 15_minutes
-    escalation_after: 30_minutes
-    escalate_to: "VP of IT"
-  P2_HIGH:
-    initial_response: 30_minutes
-    escalation_after: 2_hours
-    escalate_to: "IT Director"
-  P3_MODERATE:
-    initial_response: 4_hours
-    escalation_after: 24_hours
-    escalate_to: "Cloud Operations Manager"
+      - alert: FailoverTriggered
+        expr: |
+          increase(netflix_llm_failover_events_total{}[5m]) > 0
+        for: 0m
+        labels:
+          severity: info
+          team: llm-infrastructure
+        annotations:
+          summary: "Regional failover event triggered"
+          description: >-
+            A failover event was triggered from region {{ $labels.source_region }}
+            to region {{ $labels.target_region }}. Reason:
+            {{ $labels.reason }}. This is an informational alert. Verify that
+            traffic has been successfully rerouted and monitor the target
+            region for capacity headroom.
+          runbook_url: "https://wiki.netflix.internal/runbooks/llm-platform/failover-triggered"

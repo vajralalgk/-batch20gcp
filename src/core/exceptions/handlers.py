@@ -1,403 +1,332 @@
-"""
-============================================================================
-Enterprise Cloud Transformation Platform (ECTP)
-Custom Exception Hierarchy
-Author: Gopi Krishna Vajrala
-============================================================================
+"""Netflix LLM Platform - Custom Exceptions & FastAPI Handlers.
 
-WHY THIS MODULE EXISTS:
-    Enterprise applications need a structured exception hierarchy to:
-    1. Distinguish between client errors (4xx) and server errors (5xx)
-    2. Provide consistent error responses across all API endpoints
-    3. Enable specific error handling per integration (ServiceNow, Ellucian, AWS)
-    4. Support error tracking and metrics (e.g., count ServiceNow failures)
-    5. Avoid leaking internal details to API consumers
+Defines the platform exception hierarchy and registers FastAPI exception
+handlers that convert exceptions into structured JSON error responses with
+correlation IDs and appropriate HTTP status codes.
 
-DESIGN DECISIONS:
-    - All exceptions inherit from ECTPBaseError for catch-all handling
-    - Each exception maps to a specific HTTP status code
-    - Error codes are machine-readable (for client-side handling)
-    - Error messages are human-readable (for debugging)
-    - Integration-specific exceptions allow targeted retry logic
+Usage::
 
-SECURITY IMPLICATIONS:
-    - Internal error details are logged but NOT returned to clients
-    - Stack traces are never exposed in API responses
-    - Error messages avoid revealing system architecture details
+    from src.core.exceptions import InferenceError, GPUMemoryError
 
-ALTERNATIVES CONSIDERED:
-    - HTTP exceptions only (FastAPI): Too generic, no business context
-    - Error codes as strings: Less type-safe than exception classes
-    - Single exception class with error codes: Harder to catch specifically
-============================================================================
+    raise InferenceError("Beam search diverged", model_name="llama-3-70b")
 """
 
-from typing import Any, Dict, Optional  # Type hints for error metadata
+from __future__ import annotations
+
+import time
+import traceback
+import uuid
+from typing import Any, Dict, Optional
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 
-class ECTPBaseError(Exception):
-    """
-    Base exception class for all ECTP platform errors.
+# ---------------------------------------------------------------------------
+# Base exception
+# ---------------------------------------------------------------------------
 
-    WHY: Provides a common ancestor for all custom exceptions, enabling:
-    1. Catch-all error handling: except ECTPBaseError catches everything
-    2. Consistent structure: all errors have code, message, and status_code
-    3. Serialization: to_dict() produces consistent API error responses
+class PlatformBaseError(Exception):
+    """Base exception for all Netflix LLM Platform errors.
 
-    All ECTP-specific exceptions MUST inherit from this class.
+    Attributes:
+        message: Human-readable error description.
+        error_code: Machine-readable error code for programmatic handling.
+        status_code: Suggested HTTP status code for API responses.
+        details: Optional mapping of additional context.
     """
 
     def __init__(
         self,
-        message: str,  # Human-readable error description
-        error_code: str = "ECTP_ERROR",  # Machine-readable error code
-        status_code: int = 500,  # HTTP status code to return
-        details: Optional[Dict[str, Any]] = None,  # Additional context
-    ):
-        """
-        Initialize the base exception.
-
-        Args:
-            message: Human-readable description of what went wrong.
-                    This is logged and may be returned to API clients.
-            error_code: Machine-readable code (e.g., 'AUTH_FAILED').
-                       Clients use this to handle specific errors programmatically.
-            status_code: HTTP status code for the API response.
-                        4xx for client errors, 5xx for server errors.
-            details: Optional dictionary with additional context.
-                    Logged for debugging but NOT returned to clients in production.
-        """
-        # Call the parent Exception constructor with the message.
-        # WHY: Ensures standard exception behavior (str(error) returns message).
-        super().__init__(message)
-
-        # Store all error attributes as instance variables.
-        # WHY: These are used by the global exception handler to build
-        # consistent API error responses.
+        message: str = "An unexpected platform error occurred",
+        *,
+        error_code: str = "PLATFORM_ERROR",
+        status_code: int = 500,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self.message = message
         self.error_code = error_code
         self.status_code = status_code
         self.details = details or {}
+        super().__init__(self.message)
 
     def to_dict(self) -> Dict[str, Any]:
-        """
-        Serializes the exception to a dictionary for API responses.
-
-        WHY: Ensures every error returned to clients has the same structure.
-        Clients can always expect {error_code, message, details} in error responses.
-
-        SECURITY: The 'details' field should be filtered in production
-        to avoid leaking internal implementation details.
-
-        Returns:
-            Dictionary with error_code, message, and details.
-        """
-        return {
+        """Serialise the error to a JSON-safe dictionary."""
+        payload: Dict[str, Any] = {
             "error_code": self.error_code,
             "message": self.message,
-            "details": self.details,
         }
+        if self.details:
+            payload["details"] = self.details
+        return payload
 
 
-class NotFoundError(ECTPBaseError):
-    """
-    Raised when a requested resource does not exist.
+# ---------------------------------------------------------------------------
+# Inference errors
+# ---------------------------------------------------------------------------
 
-    WHY: Maps to HTTP 404. Used when:
-    - A database query returns no results for the given ID
-    - An AWS resource doesn't exist
-    - A ServiceNow record is not found
-
-    EXAMPLE:
-        raise NotFoundError("Migration plan", "PLAN-001")
-        # Returns: {"error_code": "NOT_FOUND", "message": "Migration plan 'PLAN-001' not found"}
-    """
+class InferenceError(PlatformBaseError):
+    """Raised when LLM inference fails (e.g. beam search divergence, OOM)."""
 
     def __init__(
         self,
-        resource_type: str,  # What kind of resource (e.g., "Migration Plan")
-        resource_id: str,  # The identifier that was not found
-        details: Optional[Dict[str, Any]] = None,  # Additional context
-    ):
-        # Construct a descriptive message that helps debugging.
-        # WHY: Generic "Not Found" messages are useless for troubleshooting.
-        super().__init__(
-            message=f"{resource_type} '{resource_id}' not found",
-            error_code="NOT_FOUND",
-            status_code=404,  # HTTP 404 Not Found
-            details=details,
-        )
-
-
-class AuthenticationError(ECTPBaseError):
-    """
-    Raised when authentication fails (invalid credentials, expired token).
-
-    WHY: Maps to HTTP 401. Distinguishes "who are you?" (401) from
-    "you don't have permission" (403). This distinction is important for:
-    - Client-side handling (redirect to login vs. show access denied)
-    - Security monitoring (track authentication failures for brute-force detection)
-
-    SECURITY: Error message must NOT reveal whether the username or password
-    was wrong (prevents user enumeration attacks).
-    """
-
-    def __init__(
-        self,
-        message: str = "Authentication failed",  # Generic by default (security)
+        message: str = "Inference failed",
+        *,
+        model_name: Optional[str] = None,
         details: Optional[Dict[str, Any]] = None,
-    ):
-        super().__init__(
-            message=message,
-            error_code="AUTH_FAILED",
-            status_code=401,  # HTTP 401 Unauthorized
-            details=details,
-        )
-
-
-class AuthorizationError(ECTPBaseError):
-    """
-    Raised when an authenticated user lacks permission for an action.
-
-    WHY: Maps to HTTP 403. The user IS authenticated but does NOT have
-    the required role or permission. Used for RBAC enforcement.
-
-    EXAMPLE:
-        # Developer trying to deploy to production
-        raise AuthorizationError(
-            "Insufficient permissions",
-            required_permission="deploy:production"
-        )
-    """
-
-    def __init__(
-        self,
-        message: str = "Insufficient permissions",
-        required_permission: Optional[str] = None,  # The permission they need
-        details: Optional[Dict[str, Any]] = None,
-    ):
-        # Include the required permission in details for logging.
-        # WHY: Helps admins understand what permission to grant.
+    ) -> None:
         _details = details or {}
-        if required_permission:
-            _details["required_permission"] = required_permission
-
+        if model_name:
+            _details["model_name"] = model_name
         super().__init__(
-            message=message,
-            error_code="FORBIDDEN",
-            status_code=403,  # HTTP 403 Forbidden
+            message,
+            error_code="INFERENCE_ERROR",
+            status_code=500,
             details=_details,
         )
 
 
-class ValidationError(ECTPBaseError):
-    """
-    Raised when input data fails validation rules.
-
-    WHY: Maps to HTTP 422. Used when Pydantic validation passes (correct types)
-    but business logic validation fails (e.g., start_date > end_date).
-
-    ALTERNATIVE: FastAPI's built-in RequestValidationError handles Pydantic
-    validation. This class handles business logic validation that Pydantic can't.
-    """
+class GPUMemoryError(PlatformBaseError):
+    """Raised when GPU memory is exhausted or allocation fails."""
 
     def __init__(
         self,
-        message: str,
-        field: Optional[str] = None,  # The field that failed validation
+        message: str = "GPU memory allocation failed",
+        *,
+        device_id: Optional[int] = None,
+        requested_mb: Optional[float] = None,
+        available_mb: Optional[float] = None,
         details: Optional[Dict[str, Any]] = None,
-    ):
+    ) -> None:
         _details = details or {}
-        if field:
-            _details["field"] = field
-
+        if device_id is not None:
+            _details["device_id"] = device_id
+        if requested_mb is not None:
+            _details["requested_mb"] = requested_mb
+        if available_mb is not None:
+            _details["available_mb"] = available_mb
         super().__init__(
-            message=message,
-            error_code="VALIDATION_ERROR",
-            status_code=422,  # HTTP 422 Unprocessable Entity
+            message,
+            error_code="GPU_MEMORY_ERROR",
+            status_code=503,
             details=_details,
         )
 
 
-class ExternalServiceError(ECTPBaseError):
-    """
-    Base exception for all external service integration failures.
-
-    WHY: External services (ServiceNow, Ellucian, AWS) can fail independently.
-    This base class enables:
-    1. Catch-all handling for any external failure
-    2. Circuit breaker pattern implementation
-    3. Specific retry logic per service type
-
-    Maps to HTTP 502 (Bad Gateway) — our service is fine but the
-    upstream service failed.
-    """
+class KVCacheOverflowError(PlatformBaseError):
+    """Raised when the KV-cache exceeds its configured token limit."""
 
     def __init__(
         self,
-        service_name: str,  # Which service failed (for metrics)
-        message: str,
-        error_code: str = "EXTERNAL_SERVICE_ERROR",
-        status_code: int = 502,  # HTTP 502 Bad Gateway
+        message: str = "KV cache overflow: token limit exceeded",
+        *,
+        max_tokens: Optional[int] = None,
+        current_tokens: Optional[int] = None,
         details: Optional[Dict[str, Any]] = None,
-    ):
+    ) -> None:
         _details = details or {}
-        _details["service"] = service_name
-
+        if max_tokens is not None:
+            _details["max_tokens"] = max_tokens
+        if current_tokens is not None:
+            _details["current_tokens"] = current_tokens
         super().__init__(
-            message=f"[{service_name}] {message}",
-            error_code=error_code,
-            status_code=status_code,
+            message,
+            error_code="KV_CACHE_OVERFLOW",
+            status_code=503,
             details=_details,
         )
 
 
-class ServiceNowError(ExternalServiceError):
-    """
-    Raised when ServiceNow API calls fail.
-
-    WHY: ServiceNow has specific error patterns:
-    - OAuth token expiry
-    - Rate limiting
-    - Instance maintenance windows
-
-    Having a dedicated exception allows:
-    - Specific retry logic (refresh token on 401)
-    - Circuit breaker tuning for ServiceNow specifically
-    - Metrics tracking for ServiceNow availability
-    """
+class ModelNotFoundError(PlatformBaseError):
+    """Raised when a requested model is not available in the registry."""
 
     def __init__(
         self,
-        message: str,
+        message: str = "Model not found",
+        *,
+        model_name: Optional[str] = None,
         details: Optional[Dict[str, Any]] = None,
-    ):
-        super().__init__(
-            service_name="ServiceNow",
-            message=message,
-            error_code="SERVICENOW_ERROR",
-            status_code=502,
-            details=details,
-        )
-
-
-class EllucianError(ExternalServiceError):
-    """
-    Raised when Ellucian Ethos API calls fail.
-
-    WHY: Ellucian APIs have unique characteristics:
-    - Ethos API key expiry
-    - Rate limits per tenant
-    - Specific error codes for data validation failures
-
-    Having a dedicated exception enables:
-    - Automatic API key refresh
-    - Tenant-specific error handling
-    - Tracking Ellucian integration health separately
-    """
-
-    def __init__(
-        self,
-        message: str,
-        details: Optional[Dict[str, Any]] = None,
-    ):
-        super().__init__(
-            service_name="Ellucian",
-            message=message,
-            error_code="ELLUCIAN_ERROR",
-            status_code=502,
-            details=details,
-        )
-
-
-class AWSServiceError(ExternalServiceError):
-    """
-    Raised when AWS API calls fail.
-
-    WHY: AWS services can fail due to:
-    - Throttling (rate limits)
-    - Service outages
-    - IAM permission issues
-    - Resource limits
-
-    The boto3 SDK raises botocore.exceptions, but we wrap them in
-    AWSServiceError to maintain our exception hierarchy and add context.
-    """
-
-    def __init__(
-        self,
-        message: str,
-        aws_service: Optional[str] = None,  # e.g., "EC2", "S3", "RDS"
-        details: Optional[Dict[str, Any]] = None,
-    ):
+    ) -> None:
         _details = details or {}
-        if aws_service:
-            _details["aws_service"] = aws_service
-
+        if model_name:
+            _details["model_name"] = model_name
         super().__init__(
-            service_name="AWS",
-            message=message,
-            error_code="AWS_ERROR",
-            status_code=502,
+            message,
+            error_code="MODEL_NOT_FOUND",
+            status_code=404,
             details=_details,
         )
 
 
-class RateLimitError(ECTPBaseError):
-    """
-    Raised when a client exceeds the API rate limit.
+# ---------------------------------------------------------------------------
+# Infrastructure errors
+# ---------------------------------------------------------------------------
 
-    WHY: Maps to HTTP 429. Rate limiting protects the platform from:
-    - Accidental infinite loops in client code
-    - Denial of service (DoS) attacks
-    - Unfair resource consumption by a single tenant
+class RegionFailoverError(PlatformBaseError):
+    """Raised when cross-region failover is triggered or fails."""
 
-    The retry_after field tells the client how long to wait,
-    which is the standard behavior per RFC 6585.
-    """
+    def __init__(
+        self,
+        message: str = "Region failover triggered",
+        *,
+        failed_region: Optional[str] = None,
+        target_region: Optional[str] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        _details = details or {}
+        if failed_region:
+            _details["failed_region"] = failed_region
+        if target_region:
+            _details["target_region"] = target_region
+        super().__init__(
+            message,
+            error_code="REGION_FAILOVER_ERROR",
+            status_code=503,
+            details=_details,
+        )
+
+
+class RateLimitExceededError(PlatformBaseError):
+    """Raised when a client exceeds the configured rate limit."""
 
     def __init__(
         self,
         message: str = "Rate limit exceeded",
-        retry_after: int = 60,  # Seconds to wait before retrying
+        *,
+        retry_after_seconds: Optional[int] = None,
         details: Optional[Dict[str, Any]] = None,
-    ):
+    ) -> None:
         _details = details or {}
-        _details["retry_after_seconds"] = retry_after
-
+        if retry_after_seconds is not None:
+            _details["retry_after_seconds"] = retry_after_seconds
         super().__init__(
-            message=message,
+            message,
             error_code="RATE_LIMIT_EXCEEDED",
-            status_code=429,  # HTTP 429 Too Many Requests
+            status_code=429,
             details=_details,
         )
+        self.retry_after_seconds = retry_after_seconds
 
 
-class ConfigurationError(ECTPBaseError):
-    """
-    Raised when a required configuration value is missing or invalid.
-
-    WHY: Configuration errors should be caught at startup, not at runtime.
-    Maps to HTTP 500 because it's a server-side issue (misconfiguration).
-
-    EXAMPLE:
-        if not settings.jwt_secret_key or settings.jwt_secret_key == "CHANGE-ME":
-            raise ConfigurationError("JWT secret key is not configured")
-    """
+class CircuitBreakerOpenError(PlatformBaseError):
+    """Raised when a circuit breaker is in the open state."""
 
     def __init__(
         self,
-        message: str,
-        config_key: Optional[str] = None,  # Which config value is problematic
+        message: str = "Circuit breaker is open",
+        *,
+        service_name: Optional[str] = None,
+        reset_after_seconds: Optional[float] = None,
         details: Optional[Dict[str, Any]] = None,
-    ):
+    ) -> None:
         _details = details or {}
-        if config_key:
-            _details["config_key"] = config_key
-
+        if service_name:
+            _details["service_name"] = service_name
+        if reset_after_seconds is not None:
+            _details["reset_after_seconds"] = reset_after_seconds
         super().__init__(
-            message=f"Configuration error: {message}",
-            error_code="CONFIG_ERROR",
-            status_code=500,  # HTTP 500 Internal Server Error
+            message,
+            error_code="CIRCUIT_BREAKER_OPEN",
+            status_code=503,
             details=_details,
         )
+
+
+# ---------------------------------------------------------------------------
+# FastAPI exception handlers
+# ---------------------------------------------------------------------------
+
+def _build_error_response(
+    request: Request,
+    status_code: int,
+    error_code: str,
+    message: str,
+    details: Optional[Dict[str, Any]] = None,
+) -> JSONResponse:
+    """Build a standardised JSON error response with a correlation ID."""
+    correlation_id = request.headers.get(
+        "x-correlation-id", str(uuid.uuid4())
+    )
+
+    body: Dict[str, Any] = {
+        "error": {
+            "code": error_code,
+            "message": message,
+            "correlation_id": correlation_id,
+            "timestamp": time.time(),
+        }
+    }
+    if details:
+        body["error"]["details"] = details
+
+    headers: Dict[str, str] = {"x-correlation-id": correlation_id}
+
+    # Attach Retry-After header for rate-limit responses.
+    if status_code == 429 and details and "retry_after_seconds" in details:
+        headers["Retry-After"] = str(details["retry_after_seconds"])
+
+    return JSONResponse(
+        status_code=status_code,
+        content=body,
+        headers=headers,
+    )
+
+
+async def _platform_error_handler(
+    request: Request, exc: PlatformBaseError
+) -> JSONResponse:
+    """Handle all ``PlatformBaseError`` sub-classes."""
+    return _build_error_response(
+        request,
+        status_code=exc.status_code,
+        error_code=exc.error_code,
+        message=exc.message,
+        details=exc.details,
+    )
+
+
+async def _unhandled_exception_handler(
+    request: Request, exc: Exception
+) -> JSONResponse:
+    """Catch-all for unexpected exceptions -- avoids leaking stack traces."""
+    return _build_error_response(
+        request,
+        status_code=500,
+        error_code="INTERNAL_SERVER_ERROR",
+        message="An unexpected internal error occurred",
+        details={"exception_type": type(exc).__name__},
+    )
+
+
+async def _validation_error_handler(
+    request: Request, exc: Exception
+) -> JSONResponse:
+    """Handle Pydantic / FastAPI request validation errors."""
+    from fastapi.exceptions import RequestValidationError
+
+    errors = exc.errors() if isinstance(exc, RequestValidationError) else []
+    return _build_error_response(
+        request,
+        status_code=422,
+        error_code="VALIDATION_ERROR",
+        message="Request validation failed",
+        details={"validation_errors": errors},
+    )
+
+
+def register_exception_handlers(app: FastAPI) -> None:
+    """Register all custom exception handlers on a FastAPI application.
+
+    Call this during application startup::
+
+        app = FastAPI()
+        register_exception_handlers(app)
+
+    Args:
+        app: The FastAPI application instance.
+    """
+    from fastapi.exceptions import RequestValidationError
+
+    app.add_exception_handler(PlatformBaseError, _platform_error_handler)
+    app.add_exception_handler(RequestValidationError, _validation_error_handler)
+    app.add_exception_handler(Exception, _unhandled_exception_handler)

@@ -1,226 +1,114 @@
-"""
-============================================================================
-Enterprise Cloud Transformation Platform (ECTP)
-Unit Tests for Health Check API Endpoints
-Author: Gopi Krishna Vajrala
-============================================================================
-
-Tests cover:
-    - GET /health - Basic liveness check
-    - GET /health/ready - Readiness check with dependency status
-    - GET /health/detailed - Detailed health with component info
-    - Response status codes, content types, and JSON structure
-    - Health check response fields validation
-============================================================================
-"""
+"""Tests for health check API endpoints (src.api.routes.health)."""
 
 import pytest
-from fastapi.testclient import TestClient
-
-from src.api.main import app
 
 
-@pytest.fixture
-def client():
-    """
-    Creates a FastAPI TestClient for testing HTTP endpoints.
+class TestHealthCheck:
+    """Tests for GET /health."""
 
-    WHY: TestClient lets us test API endpoints without starting
-    a real HTTP server. Requests are handled in-process.
-    """
-    return TestClient(app)
+    def test_health_check(self, app_client):
+        resp = app_client.get("/health")
+        assert resp.status_code == 200
 
-
-class TestHealthEndpoint:
-    """Tests for GET /health - Basic liveness check."""
-
-    def test_health_returns_200(self, client):
-        """Health endpoint returns HTTP 200."""
-        response = client.get("/health")
-        assert response.status_code == 200
-
-    def test_health_returns_json(self, client):
-        """Health endpoint returns JSON content type."""
-        response = client.get("/health")
-        assert response.headers["content-type"] == "application/json"
-
-    def test_health_status_is_healthy(self, client):
-        """Health response status field is 'healthy'."""
-        response = client.get("/health")
-        data = response.json()
-        assert data["status"] == "healthy"
-
-    def test_health_has_timestamp(self, client):
-        """Health response includes a timestamp."""
-        response = client.get("/health")
-        data = response.json()
-        assert "timestamp" in data
-        assert len(data["timestamp"]) > 0
-
-    def test_health_has_uptime(self, client):
-        """Health response includes uptime_seconds."""
-        response = client.get("/health")
-        data = response.json()
-        assert "uptime_seconds" in data
-        assert isinstance(data["uptime_seconds"], (int, float))
-        assert data["uptime_seconds"] >= 0
-
-    def test_health_has_service_name(self, client):
-        """Health response includes service name 'ECTP'."""
-        response = client.get("/health")
-        data = response.json()
-        assert data["service"] == "ECTP"
-
-    def test_health_has_version(self, client):
-        """Health response includes version."""
-        response = client.get("/health")
-        data = response.json()
-        assert "version" in data
-        assert data["version"] == "1.0.0"
-
-    def test_health_response_structure(self, client):
-        """Health response has all required fields."""
-        response = client.get("/health")
-        data = response.json()
-        required_fields = {"status", "timestamp", "uptime_seconds", "service", "version"}
-        assert required_fields.issubset(set(data.keys()))
-
-
-class TestReadinessEndpoint:
-    """Tests for GET /health/ready - Readiness check."""
-
-    def test_readiness_returns_200(self, client):
-        """Readiness endpoint returns HTTP 200 when all healthy."""
-        response = client.get("/health/ready")
-        assert response.status_code == 200
-
-    def test_readiness_returns_json(self, client):
-        """Readiness endpoint returns JSON content type."""
-        response = client.get("/health/ready")
-        assert response.headers["content-type"] == "application/json"
-
-    def test_readiness_has_status(self, client):
-        """Readiness response includes status field."""
-        response = client.get("/health/ready")
-        data = response.json()
+    def test_health_response_format(self, app_client):
+        resp = app_client.get("/health")
+        data = resp.json()
         assert "status" in data
-
-    def test_readiness_has_timestamp(self, client):
-        """Readiness response includes timestamp."""
-        response = client.get("/health/ready")
-        data = response.json()
+        assert data["status"] == "healthy"
         assert "timestamp" in data
+        assert "uptime_seconds" in data
+        assert "service" in data
+        assert "name" in data["service"]
+        assert "version" in data["service"]
 
-    def test_readiness_has_dependencies(self, client):
-        """Readiness response includes dependencies section."""
-        response = client.get("/health/ready")
-        data = response.json()
-        assert "dependencies" in data
-        assert isinstance(data["dependencies"], dict)
-
-    def test_readiness_checks_database(self, client):
-        """Readiness checks database dependency."""
-        response = client.get("/health/ready")
-        data = response.json()
-        assert "database" in data["dependencies"]
-
-    def test_readiness_checks_redis(self, client):
-        """Readiness checks Redis dependency."""
-        response = client.get("/health/ready")
-        data = response.json()
-        assert "redis" in data["dependencies"]
-
-    def test_readiness_checks_aws(self, client):
-        """Readiness checks AWS dependency."""
-        response = client.get("/health/ready")
-        data = response.json()
-        assert "aws" in data["dependencies"]
-
-    def test_readiness_dependency_has_status(self, client):
-        """Each dependency has a status field."""
-        response = client.get("/health/ready")
-        data = response.json()
-        for dep_name, dep_info in data["dependencies"].items():
-            assert "status" in dep_info, f"Dependency '{dep_name}' missing status"
+    def test_health_returns_json(self, app_client):
+        resp = app_client.get("/health")
+        assert resp.headers["content-type"] == "application/json"
 
 
-class TestDetailedHealthEndpoint:
-    """Tests for GET /health/detailed - Detailed health status."""
+class TestReadinessCheck:
+    """Tests for GET /health/ready."""
 
-    def test_detailed_returns_200(self, client):
-        """Detailed health returns HTTP 200."""
-        response = client.get("/health/detailed")
-        assert response.status_code == 200
+    def test_readiness_check(self, app_client):
+        resp = app_client.get("/health/ready")
+        assert resp.status_code in (200, 503)
+        data = resp.json()
+        assert "status" in data
+        assert data["status"] in ("ready", "not_ready")
+        assert "components" in data
 
-    def test_detailed_returns_json(self, client):
-        """Detailed health returns JSON content type."""
-        response = client.get("/health/detailed")
-        assert response.headers["content-type"] == "application/json"
+    def test_readiness_has_components(self, app_client):
+        resp = app_client.get("/health/ready")
+        data = resp.json()
+        components = data["components"]
+        assert "inference_server" in components
+        assert "gpu_fleet" in components
+        assert "redis_feature_store" in components
 
-    def test_detailed_has_status(self, client):
-        """Detailed response has status field."""
-        response = client.get("/health/detailed")
-        data = response.json()
+
+class TestDetailedHealth:
+    """Tests for GET /health/detailed."""
+
+    def test_detailed_health(self, app_client):
+        resp = app_client.get("/health/detailed")
+        assert resp.status_code == 200
+        data = resp.json()
         assert data["status"] == "healthy"
 
-    def test_detailed_has_service_info(self, client):
-        """Detailed response has service information."""
-        response = client.get("/health/detailed")
-        data = response.json()
-        assert "service" in data
-        service = data["service"]
-        assert service["name"] == "ECTP"
-        assert "version" in service
+    def test_health_includes_gpu_status(self, app_client):
+        resp = app_client.get("/health/detailed")
+        data = resp.json()
+        assert "gpu_metrics" in data
+        assert "devices" in data["gpu_metrics"]
+        devices = data["gpu_metrics"]["devices"]
+        assert len(devices) == 8
+        for device in devices:
+            assert "temperature_c" in device
+            assert "utilization_gpu_pct" in device
+            assert "status" in device
 
-    def test_detailed_has_components(self, client):
-        """Detailed response has components section."""
-        response = client.get("/health/detailed")
-        data = response.json()
-        assert "components" in data
-        components = data["components"]
-        assert "api" in components
-        assert "database" in components
-        assert "cache" in components
+    def test_health_includes_kv_cache_status(self, app_client):
+        resp = app_client.get("/health/detailed")
+        data = resp.json()
+        assert "kv_cache" in data
+        kv = data["kv_cache"]
+        assert "status" in kv
+        assert "total_blocks" in kv
+        assert "hit_rate_pct" in kv
 
-    def test_detailed_has_integrations(self, client):
-        """Detailed response has integrations section."""
-        response = client.get("/health/detailed")
-        data = response.json()
-        assert "integrations" in data
-        integrations = data["integrations"]
-        assert "servicenow" in integrations
-        assert "ellucian" in integrations
-        assert "aws" in integrations
+    def test_detailed_health_includes_session_memory(self, app_client):
+        resp = app_client.get("/health/detailed")
+        data = resp.json()
+        assert "session_memory" in data
+        assert "active_sessions" in data["session_memory"]
 
-    def test_detailed_has_uptime(self, client):
-        """Detailed response has uptime information."""
-        response = client.get("/health/detailed")
-        data = response.json()
-        assert "uptime_seconds" in data
-        assert data["uptime_seconds"] >= 0
+    def test_detailed_health_includes_multi_region(self, app_client):
+        resp = app_client.get("/health/detailed")
+        data = resp.json()
+        assert "multi_region" in data
+        assert "active_regions" in data["multi_region"]
+        assert len(data["multi_region"]["active_regions"]) >= 1
 
-    def test_detailed_has_timestamp(self, client):
-        """Detailed response has timestamp."""
-        response = client.get("/health/detailed")
-        data = response.json()
-        assert "timestamp" in data
+    def test_detailed_health_includes_model_registry(self, app_client):
+        resp = app_client.get("/health/detailed")
+        data = resp.json()
+        assert "model_registry" in data
+        assert "models" in data["model_registry"]
 
-    def test_detailed_author_attribution(self, client):
-        """Detailed response includes author attribution."""
-        response = client.get("/health/detailed")
-        data = response.json()
-        assert data["service"]["author"] == "Gopi Krishna Vajrala"
+    def test_detailed_health_includes_inference_engine(self, app_client):
+        resp = app_client.get("/health/detailed")
+        data = resp.json()
+        assert "inference_engine" in data
+        assert "throughput_tokens_per_sec" in data["inference_engine"]
 
 
 class TestNonExistentEndpoints:
     """Tests for error handling on non-existent endpoints."""
 
-    def test_404_for_unknown_path(self, client):
-        """Non-existent endpoint returns 404."""
-        response = client.get("/nonexistent")
+    def test_404_for_unknown_path(self, app_client):
+        response = app_client.get("/nonexistent")
         assert response.status_code == 404
 
-    def test_404_for_health_typo(self, client):
-        """Typo in health path returns 404."""
-        response = client.get("/healthz")
+    def test_404_for_health_typo(self, app_client):
+        response = app_client.get("/healthz")
         assert response.status_code == 404

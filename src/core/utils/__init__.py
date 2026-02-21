@@ -1,24 +1,24 @@
-"""
-============================================================================
-ECTP Utilities Module
-Author: Gopi Krishna Vajrala
-============================================================================
+"""Netflix LLM Platform - Utilities Module.
+
+Re-exports shared utility functions::
+
+    from src.core.utils import timed, retry_with_backoff, count_tokens
 """
 
 from src.core.utils.helpers import (
-    generate_id,
-    now_utc,
-    sanitize_input,
-    build_aws_arn,
+    timed,
     retry_with_backoff,
-    mask_sensitive_string,
+    count_tokens,
+    calculate_optimal_batch_size,
+    format_gpu_memory,
+    calculate_throughput_per_dollar,
 )
 
 __all__ = [
-    "generate_id",
-    "now_utc",
-    "sanitize_input",
-    "build_aws_arn",
+    "timed",
     "retry_with_backoff",
-    "mask_sensitive_string",
+    "count_tokens",
+    "calculate_optimal_batch_size",
+    "format_gpu_memory",
+    "calculate_throughput_per_dollar",
 ]

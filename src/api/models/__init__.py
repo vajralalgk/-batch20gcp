@@ -1,1 +1,2 @@
-# ECTP API Models Package - Author: Gopi Krishna Vajrala
+# Netflix LLM Personalization Platform - Models Package
+# Author: Gopi Krishna Vajrala

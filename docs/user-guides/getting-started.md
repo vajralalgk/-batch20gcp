@@ -1,418 +1,367 @@
-<div align="center">
+# Netflix Real-Time LLM Personalization & Inference Platform
+# Getting Started Guide
 
-# Getting Started with ECTP
-
-```
-╔══════════════════════════════════════════════════════════════════════════╗
-║                                                                        ║
-║      ███████╗  ██████╗ ████████╗ ██████╗                               ║
-║      ██╔════╝ ██╔════╝ ╚══██╔══╝ ██╔══██╗                             ║
-║      █████╗   ██║         ██║    ██████╔╝                              ║
-║      ██╔══╝   ██║         ██║    ██╔═══╝                               ║
-║      ███████╗ ╚██████╗    ██║    ██║                                   ║
-║      ╚══════╝  ╚═════╝   ╚═╝    ╚═╝                                   ║
-║                                                                        ║
-║          Enterprise Cloud Transformation Platform                      ║
-║                                                                        ║
-║              Your journey to cloud excellence starts here              ║
-║                                                                        ║
-╚══════════════════════════════════════════════════════════════════════════╝
-```
-
-![Version](https://img.shields.io/badge/version-1.0.0-blue?style=for-the-badge)
-![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688?style=for-the-badge&logo=fastapi&logoColor=white)
-![Docker](https://img.shields.io/badge/Docker-Required-2496ED?style=for-the-badge&logo=docker&logoColor=white)
-![License](https://img.shields.io/badge/License-Internal-red?style=for-the-badge)
-
-**Author:** Gopi Krishna Vajrala | **Audience:** New team members, developers, and operators
+**Author:** Gopi Krishna Vajrala
+**Version:** 2.0.0
+**Audience:** ML Engineers, Data Scientists, Platform Engineers
 
 ---
 
-*Estimated Setup Time:* **~5 minutes**
+## Welcome
 
-</div>
+The Netflix Real-Time LLM Personalization & Inference Platform provides a unified GPU-accelerated inference service for deploying machine learning models at scale. This guide walks you through setting up your development environment, deploying your first model, and making inference requests.
 
----
-
-## Welcome to ECTP
-
-The **Enterprise Cloud Transformation Platform (ECTP)** is your organization's unified platform for cloud infrastructure, IT service management, and Higher Education system integration.
-
-> **What you'll accomplish in this guide:**
-> - Set up your local development environment
-> - Run the ECTP API server locally
-> - Access interactive API documentation
-> - Understand where to go next
+**What you will accomplish in this guide:**
+- Set up your local development environment
+- Connect to the inference cluster
+- Deploy a model to the staging environment
+- Make your first prediction request
+- Monitor inference performance
 
 ---
 
-## Quick Architecture Overview
+## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        ECTP Architecture at a Glance                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│   ┌──────────┐     ┌──────────────┐     ┌──────────────────────────┐   │
-│   │  Client   │────▶│  FastAPI     │────▶│   Business Logic Layer   │   │
-│   │ (Browser/ │     │  API Server  │     │                          │   │
-│   │  CLI)     │     │  :8000       │     │  ┌────────┐ ┌────────┐  │   │
-│   └──────────┘     └──────────────┘     │  │Services│ │ Models │  │   │
-│                           │              │  └───┬────┘ └───┬────┘  │   │
-│                           │              └──────┼──────────┼───────┘   │
-│                           │                     │          │           │
-│                    ┌──────▼──────┐        ┌─────▼────┐ ┌──▼────────┐  │
-│                    │  Swagger UI │        │PostgreSQL│ │   Redis    │  │
-│                    │  /docs      │        │  :5432   │ │   :6379   │  │
-│                    └─────────────┘        └──────────┘ └───────────┘  │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+CLIENT REQUEST FLOW
+================================================================
+
+  Your Service (gRPC/REST)
+       |
+       v
+  API Gateway (Kong)        -- Auth, rate limiting, routing
+       |
+       v
+  Inference Orchestrator    -- Batching, model routing, caching
+       |
+       +--------> Feature Store (Redis)    -- User features
+       |
+       +--------> Prediction Cache (Redis) -- Cached results
+       |
+       v
+  GPU Inference Server      -- NVIDIA Triton on A100/H100
+  (NVIDIA Triton)
+       |
+       v
+  Response to Client        -- Prediction + metadata
+
+================================================================
 ```
 
 ---
 
-## Prerequisites Checklist
+## Prerequisites
 
-> **Before you begin**, ensure you have the following tools installed on your machine.
-
-| | Tool | Required Version | Purpose | Required? |
-|:---:|:---|:---:|:---|:---:|
-| ![Python](https://img.shields.io/badge/-Python-3776AB?style=flat-square&logo=python&logoColor=white) | **Python** | ![v3.11+](https://img.shields.io/badge/v3.11+-blue?style=flat-square) | Runtime environment | **Required** |
-| ![Docker](https://img.shields.io/badge/-Docker-2496ED?style=flat-square&logo=docker&logoColor=white) | **Docker & Docker Compose** | ![Latest](https://img.shields.io/badge/Latest-blue?style=flat-square) | Local database & cache services | **Required** |
-| ![Git](https://img.shields.io/badge/-Git-F05032?style=flat-square&logo=git&logoColor=white) | **Git** | ![v2.30+](https://img.shields.io/badge/v2.30+-blue?style=flat-square) | Version control | **Required** |
-| ![VS Code](https://img.shields.io/badge/-VS_Code-007ACC?style=flat-square&logo=visualstudiocode&logoColor=white) | **IDE (VS Code recommended)** | ![Latest](https://img.shields.io/badge/Latest-blue?style=flat-square) | Development environment | *Optional* |
-| ![Postman](https://img.shields.io/badge/-Postman-FF6C37?style=flat-square&logo=postman&logoColor=white) | **API Client (Postman/curl)** | ![Any](https://img.shields.io/badge/Any-gray?style=flat-square) | API testing | *Optional* |
-
----
-
-## Quick Start Guide
-
-```
-  ┌───────┐    ┌───────┐    ┌───────┐    ┌───────┐    ┌───────┐    ┌───────┐
-  │ Step  │───▶│ Step  │───▶│ Step  │───▶│ Step  │───▶│ Step  │───▶│ Step  │
-  │   1   │    │   2   │    │   3   │    │   4   │    │   5   │    │   6   │
-  │ Clone │    │ Setup │    │Config │    │Docker │    │  Run  │    │Access │
-  └───────┘    └───────┘    └───────┘    └───────┘    └───────┘    └───────┘
-```
+| Tool | Required Version | Purpose | Required? |
+|------|-----------------|---------|-----------|
+| **Python** | 3.11+ | Client SDK and tooling | Required |
+| **kubectl** | 1.28+ | Kubernetes cluster access | Required |
+| **AWS CLI** | 2.x | AWS authentication | Required |
+| **Docker** | 24.x+ | Local development and testing | Required |
+| **grpcurl** | Latest | gRPC endpoint testing | Recommended |
+| **nvidia-smi** | Latest | GPU verification (if local GPU) | Optional |
+| **helm** | 3.x | Deploying charts to EKS | Recommended |
 
 ---
 
-### Step 1 Clone the Repository
+## Step 1: Configure AWS Access
 
-<table>
-<tr>
-<td width="80">
-
-```
-╔═══╗
-║ 1 ║
-╚═══╝
-```
-
-</td>
-<td>
-
-**Clone the Repository** | *Required*
-
-Get the ECTP source code on your local machine.
+Request access to the Netflix LLM inference platform through your team lead. You will receive an IAM role appropriate for your function (see `security/policies/iam-policy-template.json`).
 
 ```bash
+# Configure AWS CLI with your profile
+aws configure --profile netflix-llm
+
+# Verify access
+aws sts get-caller-identity --profile netflix-llm
+```
+
+---
+
+## Step 2: Connect to the EKS Cluster
+
+```bash
+# Update kubeconfig for the inference cluster
+# Available regions: us-east-1, us-west-2, eu-west-1
+aws eks update-kubeconfig \
+    --name netflix-llm-us-east-1 \
+    --region us-east-1 \
+    --profile netflix-llm
+
+# Verify cluster access
+kubectl get nodes -l nvidia.com/gpu=true
+
+# Check GPU node status
+kubectl get pods -n llm-inference -l app=llm-inference-server
+```
+
+Expected output:
+```
+NAME                                    READY   STATUS    RESTARTS   AGE
+llm-inference-server-7f8a9b0c-abc12    1/1     Running   0          2d
+llm-inference-server-7f8a9b0c-def34    1/1     Running   0          2d
+...
+```
+
+---
+
+## Step 3: Set Up Local Development Environment
+
+```bash
+# Clone the repository
 git clone <repository-url>
-cd ECTP
-```
+cd netflix-llm-inference
 
-> **Tip:** If you don't have access to the repository, contact the Platform Architect for permissions.
-
-</td>
-</tr>
-</table>
-
----
-
-### Step 2 Set Up Python Environment
-
-<table>
-<tr>
-<td width="80">
-
-```
-╔═══╗
-║ 2 ║
-╚═══╝
-```
-
-</td>
-<td>
-
-**Set Up Python Environment** | *Required*
-
-Create an isolated Python environment and install all project dependencies.
-
-```bash
 # Create virtual environment
 python3.11 -m venv .venv
 source .venv/bin/activate
 
-# Install dependencies
+# Install the inference client SDK and development tools
 pip install -r requirements.txt
-```
+pip install -r requirements-dev.txt
 
-> **Warning:** Make sure you are using Python 3.11 or higher. Older versions are not supported and may cause compatibility issues.
-
-</td>
-</tr>
-</table>
-
----
-
-### Step 3 Configure Environment
-
-<table>
-<tr>
-<td width="80">
-
-```
-╔═══╗
-║ 3 ║
-╚═══╝
-```
-
-</td>
-<td>
-
-**Configure Environment Variables** | *Required*
-
-Set up your local environment configuration.
-
-```bash
-# Copy example environment file
+# Copy environment configuration
 cp .env.example .env
 
-# Edit .env with your local settings
-# At minimum, set:
-#   ECTP_DB_PASSWORD=your_local_postgres_password
-#   ECTP_REDIS_HOST=localhost
+# Edit .env with your settings:
+#   INFERENCE_ENDPOINT=https://llm-inference-use1.netflix.internal
+#   FEATURE_STORE_HOST=redis-features.netflix.internal
+#   MODEL_REGISTRY_TABLE=netflix-llm-model-registry
 ```
 
-> **Warning:** Never commit your `.env` file to version control. It is already listed in `.gitignore`.
-
-</td>
-</tr>
-</table>
+**Important:** Never commit your `.env` file to version control. It is listed in `.gitignore`.
 
 ---
 
-### Step 4 Start Local Services (Docker)
+## Step 4: Make Your First Prediction Request
 
-<table>
-<tr>
-<td width="80">
-
-```
-╔═══╗
-║ 4 ║
-╚═══╝
-```
-
-</td>
-<td>
-
-**Start Local Services** | *Required*
-
-Launch PostgreSQL and Redis using Docker Compose.
+### Using REST (curl)
 
 ```bash
-# Start PostgreSQL and Redis
-docker-compose -f deployment/docker/docker-compose.yml up -d
+# Health check
+curl -s https://llm-inference-use1.netflix.internal/health | jq .
+
+# Single prediction request
+curl -s -X POST https://llm-inference-use1.netflix.internal/v1/predict \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${NETFLIX_JWT_TOKEN}" \
+  -d '{
+    "user_id": "u-12345678",
+    "context": {
+      "page": "homepage",
+      "device": "smart_tv",
+      "time_of_day": "evening"
+    },
+    "content_ids": ["tt-001", "tt-002", "tt-003"],
+    "options": {
+      "num_results": 10,
+      "dry_run": true
+    }
+  }' | jq .
 ```
 
-> **Tip:** Run `docker-compose ps` to verify both services are running and healthy.
+### Using the Python SDK
 
-</td>
-</tr>
-</table>
+```python
+from netflix_llm import InferenceClient
 
----
+# Initialize client (reads config from .env)
+client = InferenceClient(
+    endpoint="https://llm-inference-use1.netflix.internal",
+    timeout_ms=50,
+)
 
-### Step 5 Run the Application
+# Single prediction
+response = client.predict(
+    user_id="u-12345678",
+    context={"page": "homepage", "device": "smart_tv"},
+    content_ids=["tt-001", "tt-002", "tt-003"],
+    num_results=10,
+)
 
-<table>
-<tr>
-<td width="80">
-
+print(f"Top recommendation: {response.predictions[0].content_id}")
+print(f"Score: {response.predictions[0].score}")
+print(f"Inference time: {response.metadata.inference_time_ms}ms")
+print(f"Model version: {response.metadata.model_version}")
 ```
-╔═══╗
-║ 5 ║
-╚═══╝
-```
 
-</td>
-<td>
-
-**Start the API Server** | *Required*
-
-Launch the ECTP FastAPI application with hot reload enabled.
+### Using gRPC
 
 ```bash
-# Start the API server
-uvicorn src.api.main:app --reload --host 0.0.0.0 --port 8000
+# Install grpcurl if not already installed
+# brew install grpcurl  (macOS)
+# go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest  (Go)
+
+# gRPC prediction request
+grpcurl -d '{
+  "user_id": "u-12345678",
+  "context": {"page": "homepage", "device": "smart_tv"},
+  "content_ids": ["tt-001", "tt-002", "tt-003"],
+  "num_results": 10
+}' \
+  llm-inference-use1.netflix.internal:8443 \
+  netflix.llm.InferenceService/Predict
 ```
-
-> **Tip:** The `--reload` flag enables auto-restart on code changes, ideal for development.
-
-</td>
-</tr>
-</table>
 
 ---
 
-### Step 6 Access the API
+## Step 5: Deploy a Model (Staging)
 
-<table>
-<tr>
-<td width="80">
+### Register Your Model
 
+```bash
+# Upload model artifacts to S3
+aws s3 cp ./model_artifacts/ \
+    s3://netflix-llm-models-staging/my-model/v1.0.0/ \
+    --recursive \
+    --profile netflix-llm
+
+# Register in model registry
+python scripts/register_model.py \
+    --name "my-recommendation-model" \
+    --version "v1.0.0" \
+    --artifact-path "s3://netflix-llm-models-staging/my-model/v1.0.0/" \
+    --framework "tensorrt" \
+    --gpu-memory-mb 8000 \
+    --max-batch-size 32
 ```
-╔═══╗
-║ 6 ║
-╚═══╝
+
+### Deploy to Staging
+
+```bash
+# Deploy model to staging (shadow mode)
+python scripts/deploy_model.py \
+    --model "my-recommendation-model" \
+    --version "v1.0.0" \
+    --environment staging \
+    --mode shadow \
+    --region us-east-1
+
+# Check deployment status
+kubectl get pods -n llm-inference-staging \
+    -l model=my-recommendation-model
 ```
 
-</td>
-<td>
+### Validate in Staging
 
-**Access the API Endpoints** | *Required*
-
-Verify the application is running by visiting the following URLs:
-
-| Endpoint | URL | Description |
-|:---|:---|:---|
-| **Swagger UI** | [http://localhost:8000/docs](http://localhost:8000/docs) | Interactive API documentation |
-| **ReDoc** | [http://localhost:8000/redoc](http://localhost:8000/redoc) | Alternative API documentation |
-| **Health Check** | [http://localhost:8000/health](http://localhost:8000/health) | Application health status |
-
-> **Success!** If the health check returns a `200 OK` response, your setup is complete!
-
-</td>
-</tr>
-</table>
+```bash
+# Run benchmark against staging
+./automation/scripts/benchmark/run_benchmark.sh \
+    --endpoint https://llm-inference-staging.netflix.internal \
+    --concurrency 16 \
+    --duration 60
+```
 
 ---
 
-## What's Next?
+## Step 6: Monitor Your Model
 
-<table>
-<tr>
-<td width="50%" valign="top">
+### Grafana Dashboards
 
-### Architecture & Design
+| Dashboard | URL | What It Shows |
+|-----------|-----|---------------|
+| Inference Overview | `https://grafana.netflix.internal/d/llm-inference` | Request rate, latency, error rate |
+| GPU Fleet Status | `https://grafana.netflix.internal/d/gpu-fleet` | GPU utilization, temperature, memory |
+| Model Performance | `https://grafana.netflix.internal/d/model-perf` | Per-model latency, throughput, cache hit rate |
+| A/B Test Results | `https://grafana.netflix.internal/d/ab-test` | Experiment metrics, engagement lift |
 
-```
-┌──────────────────────────┐
-│  Architecture Document   │
-│                          │
-│  Understand the system   │
-│  design, components,     │
-│  and data flow.          │
-│                          │
-│  >> Deep dive into the   │
-│     platform blueprint   │
-└──────────────────────────┘
-```
+### Key Metrics to Watch
 
-[Read the Architecture Document](../architecture/architecture-document.md)
+| Metric | Healthy Range | Alert Threshold |
+|--------|--------------|-----------------|
+| p99 latency | < 50ms | > 50ms |
+| Error rate | < 0.01% | > 0.1% |
+| GPU utilization | 50-80% | < 20% or > 95% |
+| Cache hit rate | > 30% | < 15% |
+| Model load time | < 60s | > 120s |
 
-</td>
-<td width="50%" valign="top">
+### CLI Monitoring
 
-### API Standards
+```bash
+# Check GPU health across the fleet
+./automation/scripts/gpu/gpu_health_check.sh \
+    --namespace llm-inference
 
-```
-┌──────────────────────────┐
-│  API Design Standards    │
-│                          │
-│  Learn about REST        │
-│  conventions, naming,    │
-│  and error handling.     │
-│                          │
-│  >> Build consistent     │
-│     and clean APIs       │
-└──────────────────────────┘
+# View real-time inference logs
+kubectl logs -f deployment/llm-inference-server \
+    -n llm-inference \
+    --tail=100
+
+# Check model status
+curl -s https://llm-inference-use1.netflix.internal/v1/models | jq .
 ```
 
-[Review API Design Standards](../design/api-design-standards.md)
+---
 
-</td>
-</tr>
-<tr>
-<td width="50%" valign="top">
+## Common Tasks
 
-### Contributing
+### Rollback a Model
 
-```
-┌──────────────────────────┐
-│  Contributing Guide      │
-│                          │
-│  Understand branching    │
-│  strategy, code review   │
-│  process, and CI/CD.     │
-│                          │
-│  >> Start contributing   │
-│     to ECTP today        │
-└──────────────────────────┘
+```bash
+# Rollback to previous version
+./automation/scripts/rollback/rollback.sh us-east-1 v2.2.0
 ```
 
-[Check the Contributing Guide](../../CONTRIBUTING.md)
+### Run GPU Health Check
 
-</td>
-<td width="50%" valign="top">
-
-### Operations
-
-```
-┌──────────────────────────┐
-│  Admin Runbook           │
-│                          │
-│  Operational procedures, │
-│  incident response, and  │
-│  maintenance guides.     │
-│                          │
-│  >> Master platform      │
-│     operations           │
-└──────────────────────────┘
+```bash
+# Check all GPUs in the inference namespace
+./automation/scripts/gpu/gpu_health_check.sh \
+    --namespace llm-inference \
+    --alert
 ```
 
-[Explore the Admin Runbook](../runbooks/admin-runbook.md)
+### View API Documentation
 
-</td>
-</tr>
-</table>
+| Resource | URL |
+|----------|-----|
+| REST API (Swagger) | `https://llm-inference-use1.netflix.internal/docs` |
+| gRPC Proto Definitions | `proto/inference_service.proto` |
+| API Design Standards | `docs/design/api-design-standards.md` |
+
+---
+
+## Project Structure
+
+```
+netflix-llm-inference/
+|-- api/                        # REST and gRPC API definitions
+|-- automation/
+|   |-- scripts/
+|       |-- benchmark/          # Inference benchmarking
+|       |-- deployment/         # Multi-region deployment
+|       |-- gpu/                # GPU health monitoring
+|       |-- rollback/           # Rollback automation
+|-- deployment/
+|   |-- docker/                 # Dockerfiles for inference images
+|   |-- helm/                   # Helm charts for EKS deployment
+|   |-- terraform/              # Infrastructure as Code
+|-- docs/
+|   |-- design/                 # API and architecture standards
+|   |-- governance/             # Project governance documents
+|   |-- user-guides/            # This guide and others
+|-- inference/                  # Core inference engine code
+|-- scripts/                    # Utility scripts
+|-- security/
+|   |-- policies/               # IAM policies, security policy
+|   |-- scanning/               # Security scanning config
+|-- tests/                      # Unit and integration tests
+```
 
 ---
 
 ## Getting Help
 
-```
-╔══════════════════════════════════════════════════════════════════════╗
-║                         Need Assistance?                            ║
-╠══════════════════════════════════════════════════════════════════════╣
-║                                                                      ║
-║   Documentation .......... Check documentation in /docs              ║
-║   ADRs ................... Review Architecture Decision Records      ║
-║                            in /docs/adr                              ║
-║   Contact ................ Gopi Krishna Vajrala                       ║
-║                            (Platform Architect)                      ║
-║                                                                      ║
-╚══════════════════════════════════════════════════════════════════════╝
-```
+| Resource | Contact |
+|----------|---------|
+| Platform Architecture | Gopi Krishna Vajrala (Platform Architect) |
+| Documentation | `/docs` directory in repository |
+| Architecture Decisions | `/docs/adr` directory |
+| Slack Channel | `#llm-inference-platform` |
+| On-Call (PagerDuty) | `llm-inference-oncall` escalation policy |
+| Bug Reports | File issue in repository with `[BUG]` prefix |
 
 ---
 
-<div align="center">
-
 **Author:** Gopi Krishna Vajrala
-
-*Happy building! Welcome to the ECTP team.*
-
-</div>
+**Last Updated:** 2026-02-21

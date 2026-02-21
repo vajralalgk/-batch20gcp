@@ -1,40 +1,126 @@
 # ============================================================================
-# Enterprise Cloud Transformation Platform (ECTP) - Bandit Security Config
+# Netflix Real-Time LLM Personalization & Inference Platform
+# Bandit Security Scanning Configuration
 # Author: Gopi Krishna Vajrala
 # ============================================================================
-# Bandit is a Python static analysis tool for finding security issues.
-# WHY: Automated security scanning catches common vulnerabilities
-# before they reach production (shift-left security).
+#
+# Bandit is a Python static analysis tool that finds common security issues.
+#
+# WHY: Automated security scanning catches vulnerabilities such as SQL
+# injection, hardcoded passwords, insecure deserialization, and unsafe
+# function calls before they reach production inference services.
+#
+# USAGE:
+#   bandit -c bandit.yaml -r src/
+#   bandit -c bandit.yaml -r src/ -f json -o bandit-report.json
+#
+# CI/CD INTEGRATION:
+#   This config is used by the GitHub Actions pipeline to scan every PR.
+#   PRs with HIGH severity findings are blocked from merging.
 # ============================================================================
 
-# Skip these test IDs (false positives for our use cases)
-skips:
-  # B101: assert_used — We use assert in tests (not production code)
-  - B101
-  # B601: paramiko_calls — We don't use paramiko
-  - B601
-
-# Only scan these directories
+# Target directories to scan
+# WHY: Only scan application source code, not vendored or generated files
 targets:
   - src/
+  - inference/
+  - services/
+  - api/
 
-# Exclude test files from security scanning
-# WHY: Test files often contain hardcoded test credentials,
-# which are expected and not a security issue.
+# Exclude directories from scanning
+# WHY: Test files contain intentional test credentials and mock data.
+# Virtual environments and generated files produce false positives.
 exclude_dirs:
   - tests/
+  - test/
   - .venv/
+  - venv/
   - .git/
   - __pycache__/
+  - node_modules/
+  - .eggs/
+  - build/
+  - dist/
+  - docs/
+  - migrations/
+  - .tox/
+  - proto_generated/
+
+# Skip specific test IDs (verified false positives for our codebase)
+skips:
+  # B101: assert_used - We use assert in debug/development paths only;
+  # production code uses proper validation. Tests rely on assert heavily.
+  - B101
+
+  # B601: paramiko_calls - We do not use paramiko for SSH connections.
+  # GPU health checks use nvidia-smi via subprocess, not SSH.
+  - B601
+
+  # B104: hardcoded_bind_all_interfaces - Our inference servers bind to
+  # 0.0.0.0 intentionally inside containers (network policies restrict access).
+  - B104
 
 # Severity levels to report
-# WHY: LOW severity findings are often false positives.
-# We focus on MEDIUM and HIGH to reduce noise.
+# WHY: Focus on MEDIUM and HIGH severity findings to reduce noise.
+# LOW severity findings are reviewed quarterly in manual audits.
 severity:
   - MEDIUM
   - HIGH
 
 # Confidence levels to report
+# WHY: LOW confidence findings have high false-positive rates.
+# We only act on MEDIUM and HIGH confidence results.
 confidence:
   - MEDIUM
   - HIGH
+
+# Profile configuration
+# WHY: These profiles group related security checks
+profiles:
+  # Network security checks (inference API endpoints)
+  netflix_inference:
+    include:
+      - any_other_function_with_shell_equals_true
+      - exec_used
+      - hardcoded_password_string
+      - hardcoded_password_funcarg
+      - hardcoded_password_default
+      - hardcoded_sql_expressions
+      - hardcoded_tmp_directory
+      - hashlib_new_insecure_functions
+      - jinja2_autoescape_false
+      - linux_commands_wildcard_injection
+      - paramiko_calls
+      - request_with_no_cert_validation
+      - set_bad_file_permissions
+      - snmp_insecure_version
+      - sql_statements
+      - ssl_with_bad_defaults
+      - ssl_with_bad_version
+      - ssl_with_no_version
+      - start_process_with_a_shell
+      - start_process_with_no_shell
+      - start_process_with_partial_path
+      - subprocess_popen_with_shell_equals_true
+      - subprocess_without_shell_equals_true
+      - try_except_continue
+      - try_except_pass
+      - weak_cryptographic_key
+      - yaml_load
+
+# Additional plugin configuration
+# WHY: Fine-tune detection for patterns specific to ML inference codebases
+plugin_settings:
+  # B108: hardcoded_tmp_directory - Allow /tmp for model caching
+  # GPU inference servers use /tmp/models for fast model loading from NVMe
+  hardcoded_tmp_directory:
+    tmp_dirs:
+      - /tmp
+      - /var/tmp
+      - /dev/shm
+
+  # B603/B607: subprocess calls - We use subprocess for nvidia-smi
+  # and model conversion utilities. Flag only shell=True usage.
+  subprocess:
+    shell:
+      - True

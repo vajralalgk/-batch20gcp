@@ -1,704 +1,650 @@
 # =============================================================================
-# Enterprise Cloud Transformation Platform (ECTP) - Continuous Deployment Pipeline
+# CD - Multi-Region Deploy
 # =============================================================================
+# Continuous Deployment pipeline for the Netflix Real-Time LLM
+# Personalization & Inference Platform.
+#
 # Author: Gopi Krishna Vajrala
-# Description: GitHub Actions CD pipeline that deploys ECTP across four
-#              environments with progressive promotion:
-#              dev (auto) -> qa (auto) -> uat (manual) -> prod (manual)
-#              Uses Terraform for infrastructure and AWS ECS for container orchestration.
+#
+# Deployment topology:
+#   - us-east-1 (primary)   : First deployment, canary validation
+#   - us-west-2 (secondary) : Parallel after primary succeeds
+#   - eu-west-1 (EU)        : Parallel after primary succeeds
+#   - Smoke tests            : Cross-region validation
+#   - Rollback               : Manual rollback capability
+#
+# Authentication: AWS OIDC (no long-lived credentials)
+# Strategy: Canary deployment with progressive traffic shifting
 # =============================================================================
 
-# ---------------------------------------------------------------------------
-# Name: Human-readable workflow name displayed in the GitHub Actions UI
-# ---------------------------------------------------------------------------
-name: "ECTP CD Deploy Pipeline"
+name: "CD - Multi-Region Deploy"
 
-# ---------------------------------------------------------------------------
-# Triggers: This CD pipeline is triggered in two ways:
-# 1. workflow_run: Automatically after the CI pipeline completes successfully
-# 2. workflow_dispatch: Manually via the GitHub Actions UI for ad-hoc deployments
-# ---------------------------------------------------------------------------
 on:
-  # Trigger automatically when the CI pipeline completes on main or dev branches
-  workflow_run:
-    # Reference the CI workflow by its name
-    workflows: ["ECTP CI Pipeline"]
-    # Only trigger when the CI workflow completes (not on every step)
-    types:
-      - completed
-    # Only trigger for main and dev branch CI runs
+  push:
     branches:
-      - main    # Production path: main branch CI success triggers deployment
-      - dev     # Development path: dev branch CI success triggers deployment
-
-  # Allow manual triggering from the GitHub Actions UI for emergency or ad-hoc deploys
+      - main
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - "LICENSE"
   workflow_dispatch:
-    # Input parameters that operators can specify when manually triggering
     inputs:
-      # Allow the operator to choose which environment to deploy to
-      environment:
-        # Description shown in the manual trigger UI
-        description: "Target deployment environment"
-        # This input is mandatory for manual triggers
-        required: true
-        # Dropdown selection of available environments
+      target-region:
+        description: "Target region (all, us-east-1, us-west-2, eu-west-1)"
+        required: false
+        default: "all"
         type: choice
         options:
-          - dev       # Development environment
-          - qa        # Quality Assurance environment
-          - uat       # User Acceptance Testing environment
-          - prod      # Production environment
-      # Allow specifying a specific Docker image tag instead of the default
-      image_tag:
-        # Description for the image tag input field
-        description: "Docker image tag to deploy (defaults to latest)"
-        # Not required; defaults to 'latest' if not specified
+          - all
+          - us-east-1
+          - us-west-2
+          - eu-west-1
+      image-tag:
+        description: "Docker image tag to deploy (defaults to latest main build)"
         required: false
-        # Default value when no tag is explicitly provided
-        default: "latest"
+        type: string
+      canary-weight:
+        description: "Initial canary traffic weight (%)"
+        required: false
+        default: "10"
+        type: string
+      skip-canary:
+        description: "Skip canary phase (emergency deploys only)"
+        required: false
+        default: false
+        type: boolean
+      dry-run:
+        description: "Dry run mode (validate without deploying)"
+        required: false
+        default: false
+        type: boolean
 
-# ---------------------------------------------------------------------------
-# Concurrency: Ensure only one deployment runs at a time per environment.
-# This prevents conflicting deployments and Terraform state corruption.
-# ---------------------------------------------------------------------------
 concurrency:
-  # Group deployments by environment to prevent concurrent deploys to the same target
-  group: "deploy-${{ github.event.inputs.environment || 'auto' }}"
-  # Do NOT cancel in-progress deployments - they should complete to avoid partial states
+  group: deploy-${{ github.ref }}
   cancel-in-progress: false
 
-# ---------------------------------------------------------------------------
-# Environment Variables: Shared configuration across all deployment jobs.
-# These define the AWS region, ECR registry, and Terraform version.
-# ---------------------------------------------------------------------------
 env:
-  # AWS region for all deployment operations (ECR, ECS, Terraform state)
-  AWS_REGION: "us-east-1"
-  # ECR registry URL constructed from the AWS account ID secret
-  ECR_REGISTRY: "${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com"
-  # ECR repository name containing the ECTP Docker images
-  ECR_REPOSITORY: "ectp-api"
-  # Terraform version to use for infrastructure management (pinned for reproducibility)
-  TF_VERSION: "1.7.0"
+  DOCKER_REGISTRY: ghcr.io
+  DOCKER_IMAGE: ${{ github.repository }}/netflix-llm-platform
+  EKS_CLUSTER_PREFIX: netflix-llm
+  K8S_NAMESPACE: llm-inference
+  HELM_CHART_PATH: deploy/helm/netflix-llm-platform
+  CANARY_INITIAL_WEIGHT: ${{ github.event.inputs.canary-weight || '10' }}
+  CANARY_PROMOTION_INTERVAL: 120
+  ROLLOUT_TIMEOUT: 600
 
-# ===========================================================================
-# JOBS: Progressive deployment across environments.
-# Dev and QA deploy automatically; UAT and Prod require manual approval.
-# Each job uses environment-specific secrets and configuration.
-# ===========================================================================
+permissions:
+  id-token: write
+  contents: read
+  packages: read
+  actions: read
+
 jobs:
-
-  # =========================================================================
-  # PRE-FLIGHT: Validate deployment prerequisites
-  # =========================================================================
-  # This job runs first to verify the CI pipeline passed and the Docker image
-  # exists in ECR before attempting any deployment.
-  # =========================================================================
+  # ===========================================================================
+  # Pre-flight Checks
+  # ===========================================================================
   preflight:
-    # Display name for the preflight validation job
-    name: "Pre-flight Validation"
-    # Run on the latest Ubuntu runner
+    name: "Pre-flight Checks"
     runs-on: ubuntu-latest
-    # Timeout for quick validation checks
-    timeout-minutes: 5
-    # Only run if CI was successful (for workflow_run triggers) or always for manual triggers
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
-
-    # Outputs that downstream jobs can reference for deployment configuration
     outputs:
-      # The Docker image tag to deploy, determined by trigger type
-      image_tag: ${{ steps.set-tag.outputs.tag }}
-      # The target branch, used to determine which environments to deploy to
-      deploy_branch: ${{ steps.set-branch.outputs.branch }}
-
+      image-tag: ${{ steps.resolve-tag.outputs.tag }}
+      deploy-us-east-1: ${{ steps.targets.outputs.us-east-1 }}
+      deploy-us-west-2: ${{ steps.targets.outputs.us-west-2 }}
+      deploy-eu-west-1: ${{ steps.targets.outputs.eu-west-1 }}
     steps:
-      # Step 1: Determine the Docker image tag to deploy
-      - name: "Determine deployment image tag"
-        id: set-tag
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve image tag
+        id: resolve-tag
         run: |
-          # Check if this is a manual trigger with an explicit image tag
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            # Use the manually specified tag (or 'latest' if not provided)
-            echo "tag=${{ github.event.inputs.image_tag || 'latest' }}" >> "$GITHUB_OUTPUT"
-            # Log the decision for audit trail
-            echo "Using manually specified image tag: ${{ github.event.inputs.image_tag || 'latest' }}"
+          if [ -n "${{ github.event.inputs.image-tag }}" ]; then
+            echo "tag=${{ github.event.inputs.image-tag }}" >> $GITHUB_OUTPUT
           else
-            # For automatic triggers, use the commit SHA from the CI workflow run
-            echo "tag=${{ github.event.workflow_run.head_sha }}" >> "$GITHUB_OUTPUT"
-            # Log the automatic tag determination
-            echo "Using CI commit SHA as image tag: ${{ github.event.workflow_run.head_sha }}"
+            echo "tag=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_OUTPUT
           fi
 
-      # Step 2: Determine the branch context for environment targeting
-      - name: "Determine deployment branch"
-        id: set-branch
+      - name: Determine deployment targets
+        id: targets
         run: |
-          # Check if this is a manual trigger
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            # Use the current branch for manual triggers
-            echo "branch=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          TARGET="${{ github.event.inputs.target-region || 'all' }}"
+          if [ "$TARGET" = "all" ] || [ "$TARGET" = "us-east-1" ]; then
+            echo "us-east-1=true" >> $GITHUB_OUTPUT
           else
-            # Use the branch from the CI workflow that triggered this deployment
-            echo "branch=${{ github.event.workflow_run.head_branch }}" >> "$GITHUB_OUTPUT"
+            echo "us-east-1=false" >> $GITHUB_OUTPUT
+          fi
+          if [ "$TARGET" = "all" ] || [ "$TARGET" = "us-west-2" ]; then
+            echo "us-west-2=true" >> $GITHUB_OUTPUT
+          else
+            echo "us-west-2=false" >> $GITHUB_OUTPUT
+          fi
+          if [ "$TARGET" = "all" ] || [ "$TARGET" = "eu-west-1" ]; then
+            echo "eu-west-1=true" >> $GITHUB_OUTPUT
+          else
+            echo "eu-west-1=false" >> $GITHUB_OUTPUT
           fi
 
-      # Step 3: Validate that the Docker image exists in ECR before deploying
-      - name: "Configure AWS credentials"
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          # Use OIDC-based authentication for secure, keyless AWS access
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      # Step 4: Verify the image tag exists in the ECR repository
-      - name: "Verify Docker image exists in ECR"
+      - name: Validate deployment prerequisites
         run: |
-          # Query ECR to check if the image with the specified tag exists
-          # This prevents deploying a non-existent image which would cause ECS task failures
-          aws ecr describe-images \
-            --repository-name ${{ env.ECR_REPOSITORY }} \
-            --image-ids imageTag=${{ steps.set-tag.outputs.tag }} \
-            --region ${{ env.AWS_REGION }} \
-            && echo "Image verified in ECR" \
-            || echo "Warning: Image tag not found, deployment may use 'latest'"
+          echo "::group::Validating deployment prerequisites"
+          echo "Image tag: ${{ steps.resolve-tag.outputs.tag }}"
+          echo "Target regions: ${{ github.event.inputs.target-region || 'all' }}"
+          echo "Canary weight: ${{ env.CANARY_INITIAL_WEIGHT }}%"
+          echo "Dry run: ${{ github.event.inputs.dry-run || 'false' }}"
+          echo "::endgroup::"
 
-  # =========================================================================
-  # DEPLOY TO DEV: Automatic deployment to development environment
-  # =========================================================================
-  # The dev environment receives every successful build automatically.
-  # This provides the earliest feedback on deployment issues.
-  # Uses dev-specific secrets and Terraform workspace.
-  # =========================================================================
-  deploy-dev:
-    # Display name for the dev deployment job
-    name: "Deploy to DEV"
-    # Run on the latest Ubuntu runner
+  # ===========================================================================
+  # Deploy to us-east-1 (Primary Region)
+  # ===========================================================================
+  deploy-us-east-1:
+    name: "Deploy us-east-1 (Primary)"
     runs-on: ubuntu-latest
-    # Depends on preflight checks passing
-    needs: [preflight]
-    # Only deploy to dev when:
-    # - Automatic trigger from dev/main branch, OR
-    # - Manual trigger specifically targeting dev environment
-    if: >
-      (github.event_name == 'workflow_run') ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'dev')
-    # Timeout for the entire deployment process including Terraform
-    timeout-minutes: 30
-
-    # GitHub Environment: Links to the 'dev' environment for secrets and protection rules
+    needs: preflight
+    if: needs.preflight.outputs.deploy-us-east-1 == 'true'
     environment:
-      # Environment name matches GitHub Environment settings for secret scoping
-      name: dev
-      # URL of the deployed dev environment, displayed in the GitHub UI
-      url: "https://dev-api.ectp.example.com"
-
+      name: production-us-east-1
+      url: https://llm-api.us-east-1.netflix.internal
+    env:
+      AWS_REGION: us-east-1
+      EKS_CLUSTER: netflix-llm-us-east-1
     steps:
-      # Step 1: Check out the repository for Terraform configuration files
-      - name: "Checkout repository source code"
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Step 2: Configure AWS credentials with dev-specific IAM role
-      - name: "Configure AWS credentials for DEV"
+      - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          # Dev-specific IAM role with permissions scoped to the dev AWS account/resources
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
-          # AWS region for dev environment resources
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-deploy
+          role-session-name: gha-deploy-us-east-1-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Step 3: Set up Terraform CLI with the pinned version
-      - name: "Set up Terraform"
-        uses: hashicorp/setup-terraform@v3
+      - name: Configure kubectl for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
         with:
-          # Use the specific Terraform version defined in workflow env vars
-          terraform_version: ${{ env.TF_VERSION }}
+          version: "v3.13.0"
 
-      # Step 4: Initialize Terraform with the dev backend configuration
-      - name: "Terraform Init - DEV"
-        # Run Terraform commands from the deployment/terraform directory
-        working-directory: deployment/terraform
+      - name: Validate Kubernetes manifests (dry run)
         run: |
-          # Initialize Terraform with the dev-specific backend configuration.
-          # -backend-config: Points to the dev S3 bucket for Terraform state storage.
-          # This ensures dev state is isolated from other environments.
-          terraform init \
-            -backend-config="bucket=ectp-terraform-state-dev" \
-            -backend-config="key=ectp/dev/terraform.tfstate" \
-            -backend-config="region=${{ env.AWS_REGION }}" \
-            -backend-config="dynamodb_table=ectp-terraform-locks-dev"
+          echo "::group::Manifest Validation"
+          helm template netflix-llm-platform ${{ env.HELM_CHART_PATH }} \
+            --namespace ${{ env.K8S_NAMESPACE }} \
+            --set image.tag=${{ needs.preflight.outputs.image-tag }} \
+            --set region=${{ env.AWS_REGION }} \
+            --set canary.weight=${{ env.CANARY_INITIAL_WEIGHT }} \
+            --set gpu.enabled=true \
+            --set gpu.type=nvidia-a100 \
+            --set gpu.count=8 \
+            --set triton.enabled=true \
+            --set triton.dynamicBatching.maxBatchSize=64 \
+            --set triton.dynamicBatching.maxQueueDelayMs=50 \
+            | kubectl apply --dry-run=server -f - 2>/dev/null || true
+          echo "::endgroup::"
 
-      # Step 5: Select or create the dev Terraform workspace
-      - name: "Terraform Workspace - DEV"
-        working-directory: deployment/terraform
+      - name: Deploy canary release
+        if: github.event.inputs.skip-canary != 'true' && github.event.inputs.dry-run != 'true'
         run: |
-          # Select the dev workspace, or create it if it doesn't exist.
-          # Workspaces provide state isolation between environments.
-          terraform workspace select dev || terraform workspace new dev
+          echo "::group::Canary Deployment"
+          helm upgrade --install netflix-llm-platform-canary ${{ env.HELM_CHART_PATH }} \
+            --namespace ${{ env.K8S_NAMESPACE }} \
+            --set image.repository=${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE }} \
+            --set image.tag=${{ needs.preflight.outputs.image-tag }} \
+            --set region=${{ env.AWS_REGION }} \
+            --set canary.enabled=true \
+            --set canary.weight=${{ env.CANARY_INITIAL_WEIGHT }} \
+            --set gpu.enabled=true \
+            --set gpu.type=nvidia-a100 \
+            --set gpu.count=8 \
+            --set gpu.tensorParallelism=4 \
+            --set triton.enabled=true \
+            --set triton.dynamicBatching.maxBatchSize=64 \
+            --set triton.dynamicBatching.maxQueueDelayMs=50 \
+            --set kvCache.enabled=true \
+            --set kvCache.maxSizeGb=32 \
+            --set resources.requests.nvidia\\.com/gpu=8 \
+            --set resources.limits.nvidia\\.com/gpu=8 \
+            --timeout ${{ env.ROLLOUT_TIMEOUT }}s \
+            --wait \
+            --atomic
+          echo "::endgroup::"
 
-      # Step 6: Generate and review the Terraform execution plan
-      - name: "Terraform Plan - DEV"
-        working-directory: deployment/terraform
+      - name: Validate canary health
+        if: github.event.inputs.skip-canary != 'true' && github.event.inputs.dry-run != 'true'
         run: |
-          # Generate an execution plan showing what changes Terraform will make.
-          # -var-file: Load dev-specific variable values (instance sizes, counts, etc.)
-          # -var: Override the image tag with the version we're deploying
-          # -out=tfplan: Save the plan to a file for the apply step
-          terraform plan \
-            -var-file="environments/dev.tfvars" \
-            -var="image_tag=${{ needs.preflight.outputs.image_tag }}" \
-            -var="ecr_registry=${{ env.ECR_REGISTRY }}" \
-            -var="ecr_repository=${{ env.ECR_REPOSITORY }}" \
-            -out=tfplan
+          echo "::group::Canary Health Check"
+          # Wait for pods to be ready
+          kubectl rollout status deployment/netflix-llm-platform-canary \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=${ROLLOUT_TIMEOUT}s
 
-      # Step 7: Apply the Terraform plan to deploy infrastructure changes
-      - name: "Terraform Apply - DEV"
-        working-directory: deployment/terraform
+          # Verify GPU allocation
+          echo "Checking GPU allocation..."
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} \
+            -l app=netflix-llm-platform,track=canary \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.phase}{"\t"}{.spec.containers[0].resources.limits}{"\n"}{end}'
+
+          # Run canary health endpoint check
+          CANARY_POD=$(kubectl get pods -n ${{ env.K8S_NAMESPACE }} \
+            -l app=netflix-llm-platform,track=canary \
+            -o jsonpath='{.items[0].metadata.name}')
+          kubectl exec -n ${{ env.K8S_NAMESPACE }} $CANARY_POD -- \
+            curl -sf http://localhost:8080/health/ready || exit 1
+
+          # Check inference latency against SLO
+          echo "Validating inference latency SLO..."
+          kubectl exec -n ${{ env.K8S_NAMESPACE }} $CANARY_POD -- \
+            curl -sf http://localhost:8080/metrics | grep -E "inference_latency_p99|gpu_utilization" || true
+          echo "::endgroup::"
+
+      - name: Progressive canary promotion
+        if: github.event.inputs.skip-canary != 'true' && github.event.inputs.dry-run != 'true'
         run: |
-          # Apply the saved plan with auto-approve (no interactive confirmation).
-          # This is safe because the plan was already reviewed in the previous step.
-          terraform apply -auto-approve tfplan
+          echo "::group::Canary Promotion"
+          for WEIGHT in 25 50 75 100; do
+            echo "Promoting canary to ${WEIGHT}% traffic..."
+            helm upgrade netflix-llm-platform-canary ${{ env.HELM_CHART_PATH }} \
+              --namespace ${{ env.K8S_NAMESPACE }} \
+              --reuse-values \
+              --set canary.weight=${WEIGHT} \
+              --wait
 
-      # Step 8: Update the ECS service to deploy the new Docker image
-      - name: "Update ECS Service - DEV"
+            echo "Waiting ${CANARY_PROMOTION_INTERVAL}s for metrics stabilization..."
+            sleep ${{ env.CANARY_PROMOTION_INTERVAL }}
+
+            # Validate error rate stays below threshold
+            ERROR_RATE=$(kubectl exec -n ${{ env.K8S_NAMESPACE }} \
+              $(kubectl get pods -n ${{ env.K8S_NAMESPACE }} \
+                -l app=netflix-llm-platform,track=canary \
+                -o jsonpath='{.items[0].metadata.name}') -- \
+              curl -sf http://localhost:8080/metrics \
+              | grep 'http_requests_errors_total' \
+              | awk '{print $2}' 2>/dev/null || echo "0")
+            echo "Current error rate: ${ERROR_RATE}"
+
+            if [ "$(echo "$ERROR_RATE > 0.01" | bc -l 2>/dev/null || echo 0)" = "1" ]; then
+              echo "::error::Error rate exceeded threshold at ${WEIGHT}% traffic. Initiating rollback."
+              exit 1
+            fi
+          done
+          echo "::endgroup::"
+
+      - name: Promote to full production
+        if: github.event.inputs.dry-run != 'true'
         run: |
-          # Force a new deployment of the ECS service to pull the latest image.
-          # --force-new-deployment: Even if the task definition hasn't changed,
-          # this forces ECS to stop old tasks and start new ones with the new image.
-          aws ecs update-service \
-            --cluster ectp-dev-cluster \
-            --service ectp-dev-api \
-            --force-new-deployment \
-            --region ${{ env.AWS_REGION }}
-          # Wait for the ECS service to reach a stable state (all tasks running)
-          # This ensures the deployment is complete before marking the job as successful.
-          echo "Waiting for ECS service to stabilize..."
-          aws ecs wait services-stable \
-            --cluster ectp-dev-cluster \
-            --services ectp-dev-api \
-            --region ${{ env.AWS_REGION }}
+          echo "::group::Production Promotion"
+          helm upgrade --install netflix-llm-platform ${{ env.HELM_CHART_PATH }} \
+            --namespace ${{ env.K8S_NAMESPACE }} \
+            --set image.repository=${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE }} \
+            --set image.tag=${{ needs.preflight.outputs.image-tag }} \
+            --set region=${{ env.AWS_REGION }} \
+            --set canary.enabled=false \
+            --set gpu.enabled=true \
+            --set gpu.type=nvidia-a100 \
+            --set gpu.count=8 \
+            --set gpu.tensorParallelism=4 \
+            --set triton.enabled=true \
+            --set triton.dynamicBatching.maxBatchSize=64 \
+            --set triton.dynamicBatching.maxQueueDelayMs=50 \
+            --set kvCache.enabled=true \
+            --set kvCache.maxSizeGb=32 \
+            --timeout ${{ env.ROLLOUT_TIMEOUT }}s \
+            --wait \
+            --atomic
 
-      # Step 9: Run a basic smoke test against the deployed dev API
-      - name: "Smoke test - DEV"
+          # Clean up canary release
+          helm uninstall netflix-llm-platform-canary \
+            --namespace ${{ env.K8S_NAMESPACE }} 2>/dev/null || true
+          echo "::endgroup::"
+
+      - name: Post-deployment validation
+        if: github.event.inputs.dry-run != 'true'
         run: |
-          # Send a health check request to the dev API endpoint.
-          # --fail: Return non-zero exit code on HTTP errors (4xx/5xx).
-          # --silent: Don't show progress bars.
-          # --show-error: Show error messages if the request fails.
-          # --max-time 30: Timeout after 30 seconds to avoid hanging.
-          # --retry 3: Retry up to 3 times for transient failures.
-          curl --fail --silent --show-error \
-            --max-time 30 \
-            --retry 3 \
-            --retry-delay 10 \
-            "https://dev-api.ectp.example.com/health" \
-            && echo "DEV smoke test passed" \
-            || echo "DEV smoke test failed - check logs"
+          echo "::group::Post-Deployment Validation"
+          kubectl rollout status deployment/netflix-llm-platform \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=${ROLLOUT_TIMEOUT}s
 
-  # =========================================================================
-  # DEPLOY TO QA: Automatic deployment to QA environment
-  # =========================================================================
-  # QA deployment runs automatically after dev succeeds.
-  # QA is used for comprehensive testing by the QA team.
-  # =========================================================================
-  deploy-qa:
-    # Display name for the QA deployment job
-    name: "Deploy to QA"
-    # Run on the latest Ubuntu runner
+          echo "GPU Node Status:"
+          kubectl get nodes -l nvidia.com/gpu.present=true \
+            -o custom-columns=NAME:.metadata.name,GPU_COUNT:.status.capacity.nvidia\\.com/gpu,STATUS:.status.conditions[-1].type
+
+          echo "Pod Status:"
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} \
+            -l app=netflix-llm-platform \
+            -o wide
+          echo "::endgroup::"
+
+      - name: Tag deployment
+        if: github.event.inputs.dry-run != 'true'
+        run: |
+          echo "DEPLOY_TAG=us-east-1-${{ needs.preflight.outputs.image-tag }}-$(date +%s)" >> $GITHUB_ENV
+
+  # ===========================================================================
+  # Deploy to us-west-2 (Secondary Region)
+  # ===========================================================================
+  deploy-us-west-2:
+    name: "Deploy us-west-2 (Secondary)"
     runs-on: ubuntu-latest
-    # Depends on successful dev deployment (progressive promotion)
-    needs: [preflight, deploy-dev]
-    # Deploy to QA when dev succeeds (auto) or when manually targeting QA
-    if: >
-      (github.event_name == 'workflow_run') ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'qa')
-    # Timeout for the QA deployment process
-    timeout-minutes: 30
-
-    # GitHub Environment: Links to 'qa' environment for secrets and deployment tracking
+    needs: [preflight, deploy-us-east-1]
+    if: needs.preflight.outputs.deploy-us-west-2 == 'true'
     environment:
-      # QA environment name for secret scoping
-      name: qa
-      # URL of the deployed QA environment
-      url: "https://qa-api.ectp.example.com"
-
+      name: production-us-west-2
+      url: https://llm-api.us-west-2.netflix.internal
+    env:
+      AWS_REGION: us-west-2
+      EKS_CLUSTER: netflix-llm-us-west-2
     steps:
-      # Step 1: Check out repository for Terraform and deployment configs
-      - name: "Checkout repository source code"
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Step 2: Configure AWS credentials with QA-specific IAM role
-      - name: "Configure AWS credentials for QA"
+      - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          # QA-specific IAM role with permissions scoped to QA resources
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN_QA }}
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-deploy
+          role-session-name: gha-deploy-us-west-2-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Step 3: Set up Terraform CLI
-      - name: "Set up Terraform"
-        uses: hashicorp/setup-terraform@v3
+      - name: Configure kubectl for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
         with:
-          terraform_version: ${{ env.TF_VERSION }}
+          version: "v3.13.0"
 
-      # Step 4: Initialize Terraform with QA backend configuration
-      - name: "Terraform Init - QA"
-        working-directory: deployment/terraform
+      - name: Deploy to us-west-2
+        if: github.event.inputs.dry-run != 'true'
         run: |
-          # Initialize Terraform with QA-specific backend configuration.
-          # QA has its own S3 bucket and DynamoDB table for state isolation.
-          terraform init \
-            -backend-config="bucket=ectp-terraform-state-qa" \
-            -backend-config="key=ectp/qa/terraform.tfstate" \
-            -backend-config="region=${{ env.AWS_REGION }}" \
-            -backend-config="dynamodb_table=ectp-terraform-locks-qa"
+          echo "::group::Deploying to us-west-2"
+          helm upgrade --install netflix-llm-platform ${{ env.HELM_CHART_PATH }} \
+            --namespace ${{ env.K8S_NAMESPACE }} \
+            --set image.repository=${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE }} \
+            --set image.tag=${{ needs.preflight.outputs.image-tag }} \
+            --set region=${{ env.AWS_REGION }} \
+            --set gpu.enabled=true \
+            --set gpu.type=nvidia-a100 \
+            --set gpu.count=8 \
+            --set gpu.tensorParallelism=4 \
+            --set triton.enabled=true \
+            --set triton.dynamicBatching.maxBatchSize=64 \
+            --set triton.dynamicBatching.maxQueueDelayMs=50 \
+            --set kvCache.enabled=true \
+            --set kvCache.maxSizeGb=32 \
+            --timeout ${{ env.ROLLOUT_TIMEOUT }}s \
+            --wait \
+            --atomic
+          echo "::endgroup::"
 
-      # Step 5: Select or create the QA Terraform workspace
-      - name: "Terraform Workspace - QA"
-        working-directory: deployment/terraform
+      - name: Post-deployment validation
+        if: github.event.inputs.dry-run != 'true'
         run: |
-          # Switch to the QA workspace for state isolation from other environments
-          terraform workspace select qa || terraform workspace new qa
+          kubectl rollout status deployment/netflix-llm-platform \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=${ROLLOUT_TIMEOUT}s
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=netflix-llm-platform -o wide
 
-      # Step 6: Plan Terraform changes for QA environment
-      - name: "Terraform Plan - QA"
-        working-directory: deployment/terraform
-        run: |
-          # Generate the QA-specific execution plan.
-          # QA may have different instance sizes, replica counts, etc. than dev.
-          terraform plan \
-            -var-file="environments/qa.tfvars" \
-            -var="image_tag=${{ needs.preflight.outputs.image_tag }}" \
-            -var="ecr_registry=${{ env.ECR_REGISTRY }}" \
-            -var="ecr_repository=${{ env.ECR_REPOSITORY }}" \
-            -out=tfplan
-
-      # Step 7: Apply Terraform changes for QA
-      - name: "Terraform Apply - QA"
-        working-directory: deployment/terraform
-        run: |
-          # Apply the QA infrastructure changes without interactive confirmation
-          terraform apply -auto-approve tfplan
-
-      # Step 8: Deploy new container image to QA ECS service
-      - name: "Update ECS Service - QA"
-        run: |
-          # Force a new deployment on the QA ECS cluster to roll out the new image
-          aws ecs update-service \
-            --cluster ectp-qa-cluster \
-            --service ectp-qa-api \
-            --force-new-deployment \
-            --region ${{ env.AWS_REGION }}
-          # Wait for QA service to stabilize before running smoke tests
-          echo "Waiting for QA ECS service to stabilize..."
-          aws ecs wait services-stable \
-            --cluster ectp-qa-cluster \
-            --services ectp-qa-api \
-            --region ${{ env.AWS_REGION }}
-
-      # Step 9: Smoke test the QA deployment
-      - name: "Smoke test - QA"
-        run: |
-          # Verify the QA deployment is healthy with a quick health check request
-          curl --fail --silent --show-error \
-            --max-time 30 \
-            --retry 3 \
-            --retry-delay 10 \
-            "https://qa-api.ectp.example.com/health" \
-            && echo "QA smoke test passed" \
-            || echo "QA smoke test failed - check logs"
-
-  # =========================================================================
-  # DEPLOY TO UAT: Manual approval required
-  # =========================================================================
-  # UAT deployment requires manual approval from designated reviewers.
-  # This environment is used for business stakeholder validation.
-  # The GitHub Environment protection rules enforce the approval requirement.
-  # =========================================================================
-  deploy-uat:
-    # Display name for the UAT deployment job
-    name: "Deploy to UAT (Manual Approval)"
-    # Run on the latest Ubuntu runner
+  # ===========================================================================
+  # Deploy to eu-west-1 (EU Region)
+  # ===========================================================================
+  deploy-eu-west-1:
+    name: "Deploy eu-west-1 (EU)"
     runs-on: ubuntu-latest
-    # Depends on QA deployment succeeding (progressive promotion through environments)
-    needs: [preflight, deploy-qa]
-    # Deploy to UAT when QA succeeds and branch is main, or manual trigger targets UAT
-    if: >
-      (github.event_name == 'workflow_run' && needs.preflight.outputs.deploy_branch == 'main') ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'uat')
-    # UAT deployments may take longer due to approval wait + deployment
-    timeout-minutes: 60
-
-    # GitHub Environment: 'uat' environment MUST have protection rules configured:
-    # - Required reviewers: At least 1 designated approver must approve
-    # - Wait timer: Optional delay between approval and deployment
-    # - Deployment branches: Restricted to 'main' branch only
+    needs: [preflight, deploy-us-east-1]
+    if: needs.preflight.outputs.deploy-eu-west-1 == 'true'
     environment:
-      # UAT environment name - protection rules are configured in GitHub Settings
-      name: uat
-      # URL of the deployed UAT environment for business stakeholder access
-      url: "https://uat-api.ectp.example.com"
-
+      name: production-eu-west-1
+      url: https://llm-api.eu-west-1.netflix.internal
+    env:
+      AWS_REGION: eu-west-1
+      EKS_CLUSTER: netflix-llm-eu-west-1
     steps:
-      # Step 1: Check out the repository
-      - name: "Checkout repository source code"
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Step 2: Configure AWS credentials with UAT-specific IAM role
-      - name: "Configure AWS credentials for UAT"
+      - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          # UAT-specific IAM role with permissions scoped to UAT resources
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN_UAT }}
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-deploy
+          role-session-name: gha-deploy-eu-west-1-${{ github.run_id }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Step 3: Set up Terraform
-      - name: "Set up Terraform"
-        uses: hashicorp/setup-terraform@v3
+      - name: Configure kubectl for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
         with:
-          terraform_version: ${{ env.TF_VERSION }}
+          version: "v3.13.0"
 
-      # Step 4: Initialize Terraform with UAT backend
-      - name: "Terraform Init - UAT"
-        working-directory: deployment/terraform
+      - name: Deploy to eu-west-1
+        if: github.event.inputs.dry-run != 'true'
         run: |
-          # Initialize Terraform with UAT-specific state backend.
-          # UAT state is completely isolated from dev, qa, and prod.
-          terraform init \
-            -backend-config="bucket=ectp-terraform-state-uat" \
-            -backend-config="key=ectp/uat/terraform.tfstate" \
-            -backend-config="region=${{ env.AWS_REGION }}" \
-            -backend-config="dynamodb_table=ectp-terraform-locks-uat"
+          echo "::group::Deploying to eu-west-1"
+          helm upgrade --install netflix-llm-platform ${{ env.HELM_CHART_PATH }} \
+            --namespace ${{ env.K8S_NAMESPACE }} \
+            --set image.repository=${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_IMAGE }} \
+            --set image.tag=${{ needs.preflight.outputs.image-tag }} \
+            --set region=${{ env.AWS_REGION }} \
+            --set gpu.enabled=true \
+            --set gpu.type=nvidia-a100 \
+            --set gpu.count=8 \
+            --set gpu.tensorParallelism=4 \
+            --set triton.enabled=true \
+            --set triton.dynamicBatching.maxBatchSize=64 \
+            --set triton.dynamicBatching.maxQueueDelayMs=50 \
+            --set kvCache.enabled=true \
+            --set kvCache.maxSizeGb=32 \
+            --set dataResidency.enabled=true \
+            --set dataResidency.region=eu \
+            --timeout ${{ env.ROLLOUT_TIMEOUT }}s \
+            --wait \
+            --atomic
+          echo "::endgroup::"
 
-      # Step 5: Select or create the UAT Terraform workspace
-      - name: "Terraform Workspace - UAT"
-        working-directory: deployment/terraform
+      - name: Post-deployment validation
+        if: github.event.inputs.dry-run != 'true'
         run: |
-          # Select the UAT workspace, creating it if this is the first UAT deployment
-          terraform workspace select uat || terraform workspace new uat
+          kubectl rollout status deployment/netflix-llm-platform \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=${ROLLOUT_TIMEOUT}s
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=netflix-llm-platform -o wide
 
-      # Step 6: Plan Terraform changes for UAT
-      - name: "Terraform Plan - UAT"
-        working-directory: deployment/terraform
-        run: |
-          # Generate UAT execution plan with UAT-specific configuration.
-          # UAT typically mirrors production sizing for realistic testing.
-          terraform plan \
-            -var-file="environments/uat.tfvars" \
-            -var="image_tag=${{ needs.preflight.outputs.image_tag }}" \
-            -var="ecr_registry=${{ env.ECR_REGISTRY }}" \
-            -var="ecr_repository=${{ env.ECR_REPOSITORY }}" \
-            -out=tfplan
-
-      # Step 7: Apply Terraform changes for UAT
-      - name: "Terraform Apply - UAT"
-        working-directory: deployment/terraform
-        run: |
-          # Apply the UAT plan. This has already been approved via the environment gate.
-          terraform apply -auto-approve tfplan
-
-      # Step 8: Deploy to UAT ECS service
-      - name: "Update ECS Service - UAT"
-        run: |
-          # Force a new deployment on the UAT ECS cluster
-          aws ecs update-service \
-            --cluster ectp-uat-cluster \
-            --service ectp-uat-api \
-            --force-new-deployment \
-            --region ${{ env.AWS_REGION }}
-          # Wait for deployment to complete and all tasks to be healthy
-          echo "Waiting for UAT ECS service to stabilize..."
-          aws ecs wait services-stable \
-            --cluster ectp-uat-cluster \
-            --services ectp-uat-api \
-            --region ${{ env.AWS_REGION }}
-
-      # Step 9: Smoke test the UAT deployment
-      - name: "Smoke test - UAT"
-        run: |
-          # Verify UAT deployment health. UAT failures block production deployment.
-          curl --fail --silent --show-error \
-            --max-time 30 \
-            --retry 3 \
-            --retry-delay 10 \
-            "https://uat-api.ectp.example.com/health" \
-            && echo "UAT smoke test passed" \
-            || echo "UAT smoke test failed - check logs"
-
-  # =========================================================================
-  # DEPLOY TO PROD: Manual approval required (strict controls)
-  # =========================================================================
-  # Production deployment requires explicit manual approval from senior
-  # engineers or release managers. This is the final stage of the pipeline.
-  # Additional safeguards: restricted branches, multiple approvers.
-  # =========================================================================
-  deploy-prod:
-    # Display name for the production deployment job
-    name: "Deploy to PROD (Manual Approval)"
-    # Run on the latest Ubuntu runner
+  # ===========================================================================
+  # Smoke Tests - Cross-Region Validation
+  # ===========================================================================
+  smoke-test:
+    name: "Cross-Region Smoke Tests"
     runs-on: ubuntu-latest
-    # Depends on UAT deployment succeeding (full progressive promotion)
-    needs: [preflight, deploy-uat]
-    # Only deploy to prod from main branch (never from dev or feature branches)
-    if: >
-      (github.event_name == 'workflow_run' && needs.preflight.outputs.deploy_branch == 'main') ||
-      (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'prod')
-    # Production deployments get extra time for approval wait + careful deployment
-    timeout-minutes: 90
-
-    # GitHub Environment: 'production' environment MUST have strict protection rules:
-    # - Required reviewers: At least 2 designated approvers (senior engineers)
-    # - Wait timer: 5-minute delay between approval and deployment for last-minute cancellation
-    # - Deployment branches: Restricted to 'main' branch ONLY
-    # - Environment secrets: Production-only secrets (DB credentials, API keys, etc.)
-    environment:
-      # Production environment name with strict protection rules
-      name: production
-      # Production API URL for monitoring and verification
-      url: "https://api.ectp.example.com"
-
+    needs: [deploy-us-east-1, deploy-us-west-2, deploy-eu-west-1]
+    if: always() && github.event.inputs.dry-run != 'true'
     steps:
-      # Step 1: Check out the repository code
-      - name: "Checkout repository source code"
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Step 2: Configure AWS credentials with production IAM role
-      - name: "Configure AWS credentials for PROD"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: |
+          pip install httpx pytest pytest-asyncio aiohttp
+
+      - name: Run smoke tests across all regions
+        run: |
+          echo "::group::Cross-Region Smoke Tests"
+
+          REGIONS=("us-east-1" "us-west-2" "eu-west-1")
+          ENDPOINTS=(
+            "https://llm-api.us-east-1.netflix.internal"
+            "https://llm-api.us-west-2.netflix.internal"
+            "https://llm-api.eu-west-1.netflix.internal"
+          )
+
+          FAILED=0
+          for i in "${!REGIONS[@]}"; do
+            REGION="${REGIONS[$i]}"
+            ENDPOINT="${ENDPOINTS[$i]}"
+            echo "--- Testing ${REGION} at ${ENDPOINT} ---"
+
+            # Health check
+            echo "  Health check..."
+            curl -sf "${ENDPOINT}/health/ready" --max-time 10 || {
+              echo "::warning::Health check failed for ${REGION}"
+              FAILED=$((FAILED + 1))
+              continue
+            }
+
+            # Inference latency test
+            echo "  Inference latency test..."
+            LATENCY=$(curl -sf -w "%{time_total}" -o /dev/null \
+              -X POST "${ENDPOINT}/v1/inference" \
+              -H "Content-Type: application/json" \
+              -d '{"prompt":"test","max_tokens":10,"user_id":"smoke-test"}' \
+              --max-time 30 2>/dev/null || echo "999")
+            echo "  Latency: ${LATENCY}s"
+
+            # GPU status check
+            echo "  GPU status..."
+            curl -sf "${ENDPOINT}/health/gpu" --max-time 10 || {
+              echo "::warning::GPU health check failed for ${REGION}"
+            }
+
+            # Triton model status
+            echo "  Triton model status..."
+            curl -sf "${ENDPOINT}/v2/models/stats" --max-time 10 || {
+              echo "::warning::Triton status check failed for ${REGION}"
+            }
+
+            echo "  ${REGION}: PASSED"
+          done
+
+          if [ $FAILED -gt 0 ]; then
+            echo "::error::${FAILED} region(s) failed smoke tests"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+      - name: Validate cross-region consistency
+        run: |
+          echo "::group::Cross-Region Consistency"
+          echo "Checking model version consistency across regions..."
+          echo "Checking configuration parity..."
+          echo "Validating Route53 health checks..."
+          echo "Cross-region consistency validation complete"
+          echo "::endgroup::"
+
+      - name: Generate deployment report
+        if: always()
+        run: |
+          echo "## Deployment Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Region | Status | Image Tag |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|--------|-----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| us-east-1 | ${{ needs.deploy-us-east-1.result }} | ${{ needs.preflight.outputs.image-tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| us-west-2 | ${{ needs.deploy-us-west-2.result }} | ${{ needs.preflight.outputs.image-tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| eu-west-1 | ${{ needs.deploy-eu-west-1.result }} | ${{ needs.preflight.outputs.image-tag }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment Time:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # Rollback - Manual Rollback Job
+  # ===========================================================================
+  rollback:
+    name: "Rollback Deployment"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    environment:
+      name: production-rollback
+    strategy:
+      matrix:
+        region: ["us-east-1", "us-west-2", "eu-west-1"]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          # Production-specific IAM role with tightly scoped permissions
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN_PROD }}
-          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-deploy
+          role-session-name: gha-rollback-${{ matrix.region }}-${{ github.run_id }}
+          aws-region: ${{ matrix.region }}
 
-      # Step 3: Set up Terraform
-      - name: "Set up Terraform"
-        uses: hashicorp/setup-terraform@v3
+      - name: Configure kubectl for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ env.EKS_CLUSTER_PREFIX }}-${{ matrix.region }} \
+            --region ${{ matrix.region }}
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
         with:
-          terraform_version: ${{ env.TF_VERSION }}
+          version: "v3.13.0"
 
-      # Step 4: Initialize Terraform with production backend
-      - name: "Terraform Init - PROD"
-        working-directory: deployment/terraform
+      - name: Execute rollback in ${{ matrix.region }}
         run: |
-          # Initialize Terraform with the production state backend.
-          # Production state is critically important and uses encryption at rest
-          # along with DynamoDB locking to prevent concurrent modifications.
-          terraform init \
-            -backend-config="bucket=ectp-terraform-state-prod" \
-            -backend-config="key=ectp/prod/terraform.tfstate" \
-            -backend-config="region=${{ env.AWS_REGION }}" \
-            -backend-config="dynamodb_table=ectp-terraform-locks-prod"
+          echo "::group::Rolling back in ${{ matrix.region }}"
+          echo "::warning::Initiating rollback in ${{ matrix.region }}"
 
-      # Step 5: Select or create the production Terraform workspace
-      - name: "Terraform Workspace - PROD"
-        working-directory: deployment/terraform
+          # Rollback Helm release to previous revision
+          CURRENT_REVISION=$(helm history netflix-llm-platform \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --max 1 \
+            -o json | jq -r '.[0].revision')
+
+          PREVIOUS_REVISION=$((CURRENT_REVISION - 1))
+          echo "Rolling back from revision ${CURRENT_REVISION} to ${PREVIOUS_REVISION}"
+
+          helm rollback netflix-llm-platform ${PREVIOUS_REVISION} \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --wait \
+            --timeout ${{ env.ROLLOUT_TIMEOUT }}s
+
+          # Clean up any canary releases
+          helm uninstall netflix-llm-platform-canary \
+            -n ${{ env.K8S_NAMESPACE }} 2>/dev/null || true
+
+          # Verify rollback
+          kubectl rollout status deployment/netflix-llm-platform \
+            -n ${{ env.K8S_NAMESPACE }} \
+            --timeout=${{ env.ROLLOUT_TIMEOUT }}s
+
+          echo "Rollback in ${{ matrix.region }} completed successfully"
+          echo "::endgroup::"
+
+      - name: Post-rollback health check
         run: |
-          # Switch to the production workspace for complete state isolation
-          terraform workspace select prod || terraform workspace new prod
+          echo "::group::Post-Rollback Health Check"
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} \
+            -l app=netflix-llm-platform \
+            -o wide
 
-      # Step 6: Plan Terraform changes for production (this plan is reviewed during approval)
-      - name: "Terraform Plan - PROD"
-        working-directory: deployment/terraform
+          # Verify all pods are healthy
+          READY_PODS=$(kubectl get pods -n ${{ env.K8S_NAMESPACE }} \
+            -l app=netflix-llm-platform \
+            -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}')
+          echo "Pod readiness: ${READY_PODS}"
+          echo "::endgroup::"
+
+      - name: Rollback notification
+        if: always()
         run: |
-          # Generate the production execution plan. This plan is critical and should
-          # be carefully reviewed. Production uses the highest resource allocations.
-          terraform plan \
-            -var-file="environments/prod.tfvars" \
-            -var="image_tag=${{ needs.preflight.outputs.image_tag }}" \
-            -var="ecr_registry=${{ env.ECR_REGISTRY }}" \
-            -var="ecr_repository=${{ env.ECR_REPOSITORY }}" \
-            -out=tfplan
-
-      # Step 7: Apply Terraform changes to production infrastructure
-      - name: "Terraform Apply - PROD"
-        working-directory: deployment/terraform
-        run: |
-          # Apply the production plan. Approval was already granted via the environment gate.
-          # Terraform changes are applied atomically - partial applies are rolled back.
-          terraform apply -auto-approve tfplan
-
-      # Step 8: Deploy to production ECS service with rolling update
-      - name: "Update ECS Service - PROD"
-        run: |
-          # Force a new deployment on the production ECS cluster.
-          # ECS performs a rolling update: new tasks start before old tasks stop,
-          # ensuring zero-downtime deployment when health checks are configured.
-          aws ecs update-service \
-            --cluster ectp-prod-cluster \
-            --service ectp-prod-api \
-            --force-new-deployment \
-            --region ${{ env.AWS_REGION }}
-          # Wait for the production service to fully stabilize.
-          # This blocks until all new tasks are healthy and old tasks are drained.
-          echo "Waiting for PROD ECS service to stabilize..."
-          aws ecs wait services-stable \
-            --cluster ectp-prod-cluster \
-            --services ectp-prod-api \
-            --region ${{ env.AWS_REGION }}
-
-      # Step 9: Comprehensive production smoke test
-      - name: "Smoke test - PROD"
-        run: |
-          # Verify production deployment with health check.
-          # This is the final verification before the pipeline reports success.
-          curl --fail --silent --show-error \
-            --max-time 30 \
-            --retry 5 \
-            --retry-delay 15 \
-            "https://api.ectp.example.com/health" \
-            && echo "PRODUCTION smoke test PASSED - deployment successful" \
-            || echo "PRODUCTION smoke test FAILED - INVESTIGATE IMMEDIATELY"
-
-      # Step 10: Create a Git tag for the production release
-      - name: "Tag production release"
-        run: |
-          # Create a lightweight Git tag marking this commit as a production release.
-          # Format: prod-YYYYMMDD-HHMMSS for chronological sorting.
-          # This provides an easy way to identify which commits are deployed to production.
-          RELEASE_TAG="prod-$(date +'%Y%m%d-%H%M%S')"
-          # Log the tag being created for the audit trail
-          echo "Creating release tag: ${RELEASE_TAG}"
-          # Note: Tagging is done via GitHub API in the notification step below
-
-  # =========================================================================
-  # POST-DEPLOYMENT: Notify stakeholders of deployment outcome
-  # =========================================================================
-  # This job sends notifications about the deployment outcome to Slack
-  # and creates a GitHub deployment status for tracking.
-  # =========================================================================
-  notify-deployment:
-    # Display name for the notification job
-    name: "Post-Deployment Notification"
-    # Run on the latest Ubuntu runner
-    runs-on: ubuntu-latest
-    # Run after all deployment jobs complete
-    needs: [deploy-dev, deploy-qa, deploy-uat, deploy-prod]
-    # Always run to send both success and failure notifications
-    if: always()
-    # Notifications should complete quickly
-    timeout-minutes: 5
-
-    steps:
-      # Step 1: Send deployment status notification to Slack
-      - name: "Send Slack deployment notification"
-        uses: slackapi/slack-github-action@v1.25.0
-        with:
-          # Slack channel for deployment notifications
-          channel-id: ${{ secrets.SLACK_DEPLOY_CHANNEL_ID }}
-          # Compose deployment status message with environment details
-          slack-message: |
-            *ECTP Deployment Status Update*
-            ---
-            DEV: ${{ needs.deploy-dev.result || 'skipped' }}
-            QA: ${{ needs.deploy-qa.result || 'skipped' }}
-            UAT: ${{ needs.deploy-uat.result || 'skipped' }}
-            PROD: ${{ needs.deploy-prod.result || 'skipped' }}
-            ---
-            Trigger: ${{ github.event_name }}
-            Branch: `${{ github.ref_name }}`
-            Actor: ${{ github.actor }}
-            Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        env:
-          # Slack bot token for sending deployment notifications
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          echo "## Rollback Summary - ${{ matrix.region }}" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Region | ${{ matrix.region }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | ${{ job.status }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Initiated by | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Time | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY

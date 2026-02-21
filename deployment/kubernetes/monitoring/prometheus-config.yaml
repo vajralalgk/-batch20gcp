@@ -1,0 +1,289 @@
+# =============================================================================
+# Netflix Real-Time LLM Platform - Prometheus Configuration
+# =============================================================================
+# ConfigMap containing the Prometheus server configuration and alerting rules.
+# Scrapes metrics from the API gateway, Triton, DCGM exporter, and
+# node-exporter at 15-second intervals.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: netflix-llm
+  labels:
+    app.kubernetes.io/name: prometheus
+    app.kubernetes.io/component: monitoring
+    app.kubernetes.io/part-of: netflix-llm-platform
+data:
+  prometheus.yml: |
+    # Global configuration applied to all scrape jobs.
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      scrape_timeout: 10s
+      external_labels:
+        cluster: "netflix-llm-prod"
+        environment: "production"
+
+    # Alert rule files to load for evaluation.
+    rule_files:
+      - "/etc/prometheus/alert-rules.yml"
+
+    # Alertmanager targets for sending triggered alerts.
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets:
+                - "alertmanager:9093"
+
+    # Scrape configurations for each target group.
+    scrape_configs:
+
+      # -----------------------------------------------------------------
+      # Prometheus self-monitoring
+      # -----------------------------------------------------------------
+      - job_name: "prometheus"
+        static_configs:
+          - targets: ["localhost:9090"]
+
+      # -----------------------------------------------------------------
+      # Netflix LLM API metrics (FastAPI application)
+      # -----------------------------------------------------------------
+      - job_name: "netflix-llm-api"
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - netflix-llm
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            action: keep
+            regex: netflix-llm-api
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            target_label: __address__
+            regex: (.+)
+            replacement: "${1}:8000"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+        metrics_path: /metrics
+        scrape_interval: 15s
+
+      # -----------------------------------------------------------------
+      # Triton Inference Server metrics
+      # -----------------------------------------------------------------
+      - job_name: "triton-inference-server"
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - netflix-llm
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            action: keep
+            regex: triton-inference-server
+          - source_labels: [__meta_kubernetes_pod_ip]
+            action: replace
+            target_label: __address__
+            regex: (.+)
+            replacement: "${1}:8003"
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+        metrics_path: /metrics
+        scrape_interval: 15s
+
+      # -----------------------------------------------------------------
+      # NVIDIA DCGM Exporter metrics (GPU telemetry)
+      # -----------------------------------------------------------------
+      - job_name: "dcgm-exporter"
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - netflix-llm
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+            action: keep
+            regex: dcgm-exporter
+          - source_labels: [__meta_kubernetes_pod_ip]
+            action: replace
+            target_label: __address__
+            regex: (.+)
+            replacement: "${1}:9400"
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+        metrics_path: /metrics
+        scrape_interval: 15s
+
+      # -----------------------------------------------------------------
+      # Node Exporter metrics (host-level CPU, memory, disk, network)
+      # -----------------------------------------------------------------
+      - job_name: "node-exporter"
+        kubernetes_sd_configs:
+          - role: node
+        relabel_configs:
+          - action: replace
+            source_labels: [__address__]
+            regex: (.+):(.+)
+            replacement: "${1}:9100"
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_node_name]
+            target_label: node
+        metrics_path: /metrics
+        scrape_interval: 15s
+
+  alert-rules.yml: |
+    groups:
+      # ---------------------------------------------------------------
+      # Inference Latency Alerts
+      # ---------------------------------------------------------------
+      - name: inference_latency
+        rules:
+          - alert: HighInferenceLatencyP95
+            expr: |
+              histogram_quantile(0.95,
+                sum(rate(http_request_duration_seconds_bucket{job="netflix-llm-api"}[5m])) by (le)
+              ) > 0.2
+            for: 5m
+            labels:
+              severity: warning
+              team: ml-platform
+            annotations:
+              summary: "P95 inference latency exceeds 200ms"
+              description: "P95 inference latency is {{ $value | humanizeDuration }} (threshold: 200ms) for the past 5 minutes."
+              runbook_url: "https://wiki.netflix.com/runbooks/llm-platform/high-latency"
+
+          - alert: CriticalInferenceLatencyP99
+            expr: |
+              histogram_quantile(0.99,
+                sum(rate(http_request_duration_seconds_bucket{job="netflix-llm-api"}[5m])) by (le)
+              ) > 0.5
+            for: 5m
+            labels:
+              severity: critical
+              team: ml-platform
+            annotations:
+              summary: "P99 inference latency exceeds 500ms"
+              description: "P99 inference latency is {{ $value | humanizeDuration }} (threshold: 500ms) for the past 5 minutes."
+
+      # ---------------------------------------------------------------
+      # GPU Utilization Alerts
+      # ---------------------------------------------------------------
+      - name: gpu_utilization
+        rules:
+          - alert: LowGPUUtilization
+            expr: |
+              avg(DCGM_FI_DEV_GPU_UTIL{job="dcgm-exporter"}) < 40
+            for: 15m
+            labels:
+              severity: warning
+              team: ml-platform
+            annotations:
+              summary: "GPU utilization below 40%"
+              description: "Average GPU utilization is {{ $value }}% (threshold: 40%) for the past 15 minutes. Consider scaling down or consolidating workloads."
+
+          - alert: HighGPUUtilization
+            expr: |
+              avg(DCGM_FI_DEV_GPU_UTIL{job="dcgm-exporter"}) > 95
+            for: 10m
+            labels:
+              severity: warning
+              team: ml-platform
+            annotations:
+              summary: "GPU utilization above 95%"
+              description: "Average GPU utilization is {{ $value }}%. Consider scaling up."
+
+          - alert: GPUMemoryPressure
+            expr: |
+              (DCGM_FI_DEV_FB_USED{job="dcgm-exporter"} / DCGM_FI_DEV_FB_FREE{job="dcgm-exporter"}) > 0.9
+            for: 5m
+            labels:
+              severity: critical
+              team: ml-platform
+            annotations:
+              summary: "GPU memory usage exceeds 90%"
+              description: "GPU memory utilization is above 90% on {{ $labels.pod }}. Risk of OOM."
+
+      # ---------------------------------------------------------------
+      # Error Rate Alerts
+      # ---------------------------------------------------------------
+      - name: error_rate
+        rules:
+          - alert: HighErrorRate
+            expr: |
+              sum(rate(http_requests_total{job="netflix-llm-api", status=~"5.."}[5m]))
+              /
+              sum(rate(http_requests_total{job="netflix-llm-api"}[5m]))
+              > 0.01
+            for: 5m
+            labels:
+              severity: critical
+              team: ml-platform
+            annotations:
+              summary: "Error rate exceeds 1%"
+              description: "HTTP 5xx error rate is {{ $value | humanizePercentage }} (threshold: 1%) for the past 5 minutes."
+              runbook_url: "https://wiki.netflix.com/runbooks/llm-platform/high-error-rate"
+
+          - alert: HighTritonErrorRate
+            expr: |
+              sum(rate(nv_inference_request_failure{job="triton-inference-server"}[5m]))
+              /
+              (sum(rate(nv_inference_request_success{job="triton-inference-server"}[5m]))
+              + sum(rate(nv_inference_request_failure{job="triton-inference-server"}[5m])))
+              > 0.01
+            for: 5m
+            labels:
+              severity: critical
+              team: ml-platform
+            annotations:
+              summary: "Triton inference error rate exceeds 1%"
+              description: "Triton inference failure rate is {{ $value | humanizePercentage }}."
+
+      # ---------------------------------------------------------------
+      # KV Cache Pressure Alerts
+      # ---------------------------------------------------------------
+      - name: kv_cache
+        rules:
+          - alert: KVCachePressureHigh
+            expr: |
+              (nv_trt_llm_kv_cache_block_metrics_used{job="triton-inference-server"}
+              /
+              nv_trt_llm_kv_cache_block_metrics_max{job="triton-inference-server"})
+              > 0.9
+            for: 5m
+            labels:
+              severity: critical
+              team: ml-platform
+            annotations:
+              summary: "KV cache utilization exceeds 90%"
+              description: "TensorRT-LLM KV cache is {{ $value | humanizePercentage }} full on {{ $labels.pod }}. New requests may be queued or rejected."
+              runbook_url: "https://wiki.netflix.com/runbooks/llm-platform/kv-cache-pressure"
+
+          - alert: KVCachePressureWarning
+            expr: |
+              (nv_trt_llm_kv_cache_block_metrics_used{job="triton-inference-server"}
+              /
+              nv_trt_llm_kv_cache_block_metrics_max{job="triton-inference-server"})
+              > 0.75
+            for: 10m
+            labels:
+              severity: warning
+              team: ml-platform
+            annotations:
+              summary: "KV cache utilization exceeds 75%"
+              description: "TensorRT-LLM KV cache is {{ $value | humanizePercentage }} full on {{ $labels.pod }}. Monitor closely."

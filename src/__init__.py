@@ -1,8 +1,9 @@
-# ============================================================================
-# Enterprise Cloud Transformation Platform (ECTP)
-# Root package initializer
-# Author: Gopi Krishna Vajrala
-# ============================================================================
-# This file marks the src/ directory as a Python package, enabling imports
-# like 'from src.core.config import settings' across the application.
-# ============================================================================
+"""Netflix Real-Time LLM Personalization & Inference Platform.
+
+Production-grade platform for serving personalized LLM inference
+with GPU-accelerated batching, KV-cache management, multi-region
+failover, and real-time observability.
+"""
+
+__version__ = "1.0.0"
+__app_name__ = "netflix-llm-platform"

@@ -1,254 +1,141 @@
-<div align="center">
+# ADR-002: Terraform for Multi-Region GPU Infrastructure as Code
 
-# ADR-002: Terraform for Infrastructure as Code
-
-![Status](https://img.shields.io/badge/Status-ACCEPTED-brightgreen?style=for-the-badge)
-![Category](https://img.shields.io/badge/Category-Infrastructure-blue?style=for-the-badge)
-![Priority](https://img.shields.io/badge/Priority-Critical-red?style=for-the-badge)
-
-</div>
-
----
-
-```
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                                                                            ║
-║   DECISION SUMMARY                                                         ║
-║                                                                            ║
-║   Use Terraform as the primary Infrastructure as Code (IaC) tool           ║
-║   for ECTP.                                                                ║
-║                                                                            ║
-║   Terraform provides multi-cloud support, mature module ecosystem,         ║
-║   built-in state management, and the largest community -- making it        ║
-║   the industry-standard choice for defining ECTP infrastructure as         ║
-║   code for repeatability, version control, and multi-environment           ║
-║   deployment.                                                              ║
-║                                                                            ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-```
-
----
-
-## Document Metadata
-
-| Field | Details |
-|:---|:---|
-| **ADR Number** | ADR-002 |
-| **Title** | Terraform for Infrastructure as Code |
-| **Author** | Gopi Krishna Vajrala |
-| **Date** | 2026-02-16 |
-| **Status** | ![ACCEPTED](https://img.shields.io/badge/ACCEPTED-brightgreen?style=flat-square) |
-| **Reviewers** | Platform Architecture Team |
-| **Category** | Infrastructure Tooling |
-| **Supersedes** | N/A |
+**Status:** ACCEPTED
+**Date:** 2026-02-21
+**Author:** Gopi Krishna Vajrala
+**Deciders:** Platform Engineering Team, Infrastructure Team
+**Category:** Infrastructure
 
 ---
 
 ## Context
 
-### Problem Statement
+The Netflix LLM Platform requires reproducible provisioning of GPU infrastructure across three AWS regions (us-east-1, us-west-2, eu-west-1). The infrastructure includes:
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                                                                          │
-│   ECTP infrastructure must be defined as code for repeatability,         │
-│   version control, and multi-environment deployment.                     │
-│                                                                          │
-│   Key Requirements:                                                      │
-│   ├── Infrastructure defined as version-controlled code                  │
-│   ├── Repeatable deployments across multiple environments                │
-│   ├── Multi-cloud capability (future-proofing)                           │
-│   ├── Mature module/reuse system                                         │
-│   └── Strong community and enterprise adoption                           │
-│                                                                          │
-└──────────────────────────────────────────────────────────────────────────┘
-```
+- EKS clusters with GPU node groups (p4d.24xlarge instances with 8x A100 GPUs)
+- ElastiCache Redis 7 clusters for user profile caching and feature vectors
+- DynamoDB Global Tables for cross-region user data replication
+- S3 buckets with cross-region replication for model artifact storage
+- VPC networking with private subnets, NAT gateways, and VPC peering
+- IAM roles, policies, and OIDC providers for CI/CD authentication
+- Route53 latency-based routing with health checks
+- CloudWatch dashboards and alarms for monitoring
+- WAF rules and Shield Advanced for security
 
----
+The infrastructure must be:
+- Reproducible across all three regions with minimal configuration differences
+- Version-controlled for audit trail and rollback capability
+- Testable in staging before production application
+- Modular to enable independent updates of individual components
+- Drift-detectable to catch manual changes
 
 ## Decision
 
-> **We will use Terraform as the primary IaC tool for ECTP.**
-
----
+We adopt **Terraform** (HashiCorp Configuration Language) as the Infrastructure as Code tool for all multi-region GPU infrastructure provisioning.
 
 ## Alternatives Considered
 
-### Comparison Matrix
+### AWS CloudFormation
 
-| Criteria | Terraform | CloudFormation | Pulumi | CDK |
-|:---|:---:|:---:|:---:|:---:|
-| **Multi-Cloud** | Yes | AWS Only | Yes | AWS-focused |
-| **State Mgmt** | Built-in | AWS-managed | Built-in | AWS-managed |
-| **Module System** | Mature | Nested stacks | Libraries | Constructs |
-| **Community** | Largest | AWS-focused | Growing | Growing |
-| **Language** | HCL | JSON/YAML | Any | TypeScript/Python |
+- **Pros:** Native AWS integration, no state management concerns, automatic drift detection, StackSets for multi-region
+- **Cons:** AWS-only (limits future multi-cloud), verbose YAML/JSON syntax, slower iteration cycle, limited module reusability, poor error messages
+- **Rejected because:** CloudFormation StackSets add operational complexity for multi-region GPU deployments. The verbose syntax makes GPU-specific configurations (NVIDIA device plugin, Triton config maps) difficult to maintain. No support for non-AWS resources (GitHub OIDC, Datadog integration).
 
-### Detailed Evaluation
+### Pulumi
 
-<table>
-<tr>
-<th width="25%">Terraform</th>
-<th width="25%">CloudFormation</th>
-<th width="25%">Pulumi</th>
-<th width="25%">CDK</th>
-</tr>
-<tr>
-<td>
+- **Pros:** Real programming languages (Python, TypeScript), strong typing, familiar paradigms, good AWS support
+- **Cons:** Smaller ecosystem, fewer community modules, team unfamiliar with Pulumi patterns, state management via Pulumi Cloud adds vendor dependency
+- **Rejected because:** The team has extensive Terraform experience. Pulumi's smaller ecosystem means fewer pre-built modules for GPU infrastructure patterns. The state management dependency on Pulumi Cloud is a concern for a critical infrastructure pipeline.
 
-```
-┌────────────┐
-│ Terraform  │
-│            │
-│ Score: 9/10│
-│ ★★★★★★★★★☆│
-│            │
-│ SELECTED   │
-└────────────┘
-```
+### AWS CDK
 
-**Strengths:**
-- Multi-cloud
-- Largest community
-- Mature modules
-- Built-in state
-
-**Weaknesses:**
-- HCL learning curve
-- State file mgmt
-
-</td>
-<td>
-
-```
-┌────────────┐
-│ CloudForm. │
-│            │
-│ Score: 6/10│
-│ ★★★★★★☆☆☆☆│
-│            │
-│ REJECTED   │
-└────────────┘
-```
-
-**Strengths:**
-- Native AWS
-- AWS-managed state
-- Deep integration
-
-**Weaknesses:**
-- AWS only
-- Verbose syntax
-- Slow updates
-
-</td>
-<td>
-
-```
-┌────────────┐
-│  Pulumi    │
-│            │
-│ Score: 7/10│
-│ ★★★★★★★☆☆☆│
-│            │
-│ REJECTED   │
-└────────────┘
-```
-
-**Strengths:**
-- Any language
-- Multi-cloud
-- Modern approach
-
-**Weaknesses:**
-- Smaller community
-- Newer tool
-- Less enterprise adoption
-
-</td>
-<td>
-
-```
-┌────────────┐
-│    CDK     │
-│            │
-│ Score: 6/10│
-│ ★★★★★★☆☆☆☆│
-│            │
-│ REJECTED   │
-└────────────┘
-```
-
-**Strengths:**
-- Real languages
-- AWS constructs
-- Type safety
-
-**Weaknesses:**
-- AWS-focused
-- Generates CFN
-- Abstraction layers
-
-</td>
-</tr>
-</table>
-
-### Community & Ecosystem Comparison
-
-```
-  Community Size (relative scale)
-  ─────────────────────────────────────────────────────
-
-  Terraform       ██████████████████████████████████████  Largest
-  CloudFormation  ██████████████████████                  AWS-focused
-  Pulumi          █████████████                           Growing
-  CDK             ██████████████                          Growing
-
-  ─────────────────────────────────────────────────────
-```
-
----
+- **Pros:** TypeScript/Python, generates CloudFormation, L2/L3 constructs for common patterns
+- **Cons:** Still generates CloudFormation (inherits its limitations), abstraction can hide important details, less mature for GPU workloads, limited community patterns for ML infrastructure
+- **Rejected because:** CDK abstractions can obscure GPU-specific configurations that require precise control (NVIDIA device plugin versions, GPU topology awareness, EFA networking). The CloudFormation backend limits deployment speed.
 
 ## Consequences
 
-### Positive Outcomes
+### Positive
 
-| # | Outcome | Impact |
-|:---:|:---|:---|
-| &#9989; | **Industry standard** -- Widely adopted across enterprises, ensuring long-term viability | High |
-| &#9989; | **Excellent module ecosystem** -- Terraform Registry provides thousands of reusable modules | High |
-| &#9989; | **State management** -- Built-in state tracking ensures infrastructure drift detection | High |
-| &#9989; | **Multi-cloud support** -- Future-proofs ECTP against potential cloud migration needs | Medium |
-| &#9989; | **Plan/Apply workflow** -- Preview changes before applying, reducing deployment risk | Medium |
+- **Module reusability:** Custom Terraform modules encapsulate GPU cluster patterns, enabling consistent provisioning across regions with region-specific overrides.
+- **State management:** Remote state in S3 with DynamoDB locking enables team collaboration and prevents concurrent modification conflicts.
+- **Plan/Apply workflow:** `terraform plan` provides a preview of infrastructure changes before application, critical for GPU infrastructure where misconfigurations can be costly ($32/hr per p4d.24xlarge).
+- **Ecosystem:** Rich provider ecosystem for AWS, Kubernetes, Helm, and monitoring tools. Community modules for EKS, VPC, and IAM reduce boilerplate.
+- **Drift detection:** `terraform plan` detects manual changes, ensuring infrastructure matches the declared state.
 
-### Negative Outcomes
+### Negative
 
-| # | Outcome | Mitigation |
-|:---:|:---|:---|
-| &#9888; | **HCL learning curve** for team members unfamiliar with the language | Mitigated by extensive documentation, tutorials, and team training sessions |
-| &#9888; | **State file management** requires careful configuration | Mitigated by using S3 + DynamoDB backend for remote state with locking |
+- **State file management:** Requires careful handling of the state file. Mitigated with S3 backend, encryption, and DynamoDB locking.
+- **HCL learning curve:** HCL is not a general-purpose language; complex logic (conditional GPU provisioning) can be awkward. Mitigated with clear module interfaces.
+- **Provider version management:** AWS provider updates can introduce breaking changes. Mitigated with version pinning and automated testing.
+
+### Module Structure
+
+```
+terraform/
+├── modules/
+│   ├── gpu_cluster/           # EKS + GPU node groups + NVIDIA plugins
+│   │   ├── main.tf
+│   │   ├── variables.tf
+│   │   ├── outputs.tf
+│   │   ├── gpu_nodegroup.tf   # p4d.24xlarge configuration
+│   │   ├── nvidia_plugin.tf   # NVIDIA device plugin + DCGM
+│   │   └── triton.tf          # Triton Inference Server deployment
+│   ├── networking/            # VPC, subnets, security groups, EFA
+│   │   ├── main.tf
+│   │   ├── vpc.tf
+│   │   ├── efa.tf             # Elastic Fabric Adapter for GPU nodes
+│   │   └── outputs.tf
+│   ├── inference/             # Model serving infrastructure
+│   │   ├── main.tf
+│   │   ├── model_repo.tf      # S3 model repository
+│   │   ├── triton_config.tf   # Triton configuration
+│   │   └── outputs.tf
+│   ├── cache/                 # ElastiCache Redis clusters
+│   │   ├── main.tf
+│   │   ├── redis.tf
+│   │   └── outputs.tf
+│   ├── monitoring/            # CloudWatch, Prometheus, Grafana
+│   │   ├── main.tf
+│   │   ├── dashboards.tf
+│   │   ├── alarms.tf
+│   │   └── outputs.tf
+│   └── security/              # IAM, WAF, Shield, KMS
+│       ├── main.tf
+│       ├── iam.tf
+│       ├── waf.tf
+│       ├── oidc.tf            # GitHub Actions OIDC provider
+│       └── outputs.tf
+├── environments/
+│   ├── production/
+│   │   ├── us-east-1/         # Primary region
+│   │   │   ├── main.tf
+│   │   │   ├── terraform.tfvars
+│   │   │   └── backend.tf
+│   │   ├── us-west-2/         # Secondary region
+│   │   │   ├── main.tf
+│   │   │   ├── terraform.tfvars
+│   │   │   └── backend.tf
+│   │   └── eu-west-1/         # EU region
+│   │       ├── main.tf
+│   │       ├── terraform.tfvars
+│   │       └── backend.tf
+│   └── staging/
+│       └── us-east-1/
+│           ├── main.tf
+│           ├── terraform.tfvars
+│           └── backend.tf
+└── global/                    # Cross-region resources
+    ├── route53.tf             # Latency-based routing
+    ├── dynamodb_global.tf     # Global tables
+    ├── s3_replication.tf      # Cross-region model replication
+    └── iam_global.tf          # Global IAM roles
+```
 
 ---
 
-## References
+**References:**
 
-| Resource | Link |
-|:---|:---|
-| Terraform Official Documentation | [https://developer.hashicorp.com/terraform](https://developer.hashicorp.com/terraform) |
-| Terraform Registry | [https://registry.terraform.io](https://registry.terraform.io) |
-| Terraform AWS Provider | [https://registry.terraform.io/providers/hashicorp/aws](https://registry.terraform.io/providers/hashicorp/aws) |
-| HashiCorp Learn Platform | [https://developer.hashicorp.com/terraform/tutorials](https://developer.hashicorp.com/terraform/tutorials) |
-
----
-
-<div align="center">
-
-**Author:** Gopi Krishna Vajrala
-
-![Status](https://img.shields.io/badge/Status-ACCEPTED-brightgreen?style=flat-square)
-&nbsp;&nbsp;|&nbsp;&nbsp;
-**ADR-002**
-&nbsp;&nbsp;|&nbsp;&nbsp;
-**2026-02-16**
-
-</div>
+- [Terraform AWS Provider](https://registry.terraform.io/providers/hashicorp/aws/latest)
+- [Terraform EKS Module](https://registry.terraform.io/modules/terraform-aws-modules/eks/aws/latest)
+- [AWS GPU Instances](https://aws.amazon.com/ec2/instance-types/p4/)

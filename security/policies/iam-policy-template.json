@@ -1,128 +1,466 @@
 {
-    "_comment": "ECTP IAM Policy Template - Author: Gopi Krishna Vajrala. This policy follows the principle of least privilege, granting only the permissions needed for the ECTP application to function.",
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Sid": "ECTPReadS3Buckets",
-            "Effect": "Allow",
-            "Action": [
-                "s3:GetObject",
-                "s3:ListBucket",
-                "s3:GetBucketLocation"
-            ],
-            "Resource": [
-                "arn:aws:s3:::ectp-*",
-                "arn:aws:s3:::ectp-*/*"
-            ],
-            "Condition": {
-                "StringEquals": {
-                    "aws:RequestedRegion": "us-east-1"
+    "_metadata": {
+        "description": "Netflix Real-Time LLM Personalization & Inference Platform - IAM Policy Templates",
+        "author": "Gopi Krishna Vajrala",
+        "version": "2.0.0",
+        "last_updated": "2026-02-21",
+        "principle": "Least privilege - each role has only the permissions required for its function"
+    },
+    "policies": {
+        "inference-service": {
+            "_description": "IAM policy for the LLM inference service running on EKS. Grants access to model artifacts in S3, prediction cache, feature store, and GPU resources.",
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "ReadModelArtifactsFromS3",
+                    "Effect": "Allow",
+                    "Action": [
+                        "s3:GetObject",
+                        "s3:ListBucket",
+                        "s3:GetBucketLocation",
+                        "s3:HeadObject"
+                    ],
+                    "Resource": [
+                        "arn:aws:s3:::netflix-llm-models-*",
+                        "arn:aws:s3:::netflix-llm-models-*/*"
+                    ]
+                },
+                {
+                    "Sid": "WriteInferenceLogsToS3",
+                    "Effect": "Allow",
+                    "Action": [
+                        "s3:PutObject"
+                    ],
+                    "Resource": [
+                        "arn:aws:s3:::netflix-llm-inference-logs-*/*"
+                    ]
+                },
+                {
+                    "Sid": "AccessModelRegistry",
+                    "Effect": "Allow",
+                    "Action": [
+                        "dynamodb:GetItem",
+                        "dynamodb:Query",
+                        "dynamodb:BatchGetItem"
+                    ],
+                    "Resource": [
+                        "arn:aws:dynamodb:*:*:table/netflix-llm-model-registry",
+                        "arn:aws:dynamodb:*:*:table/netflix-llm-model-registry/index/*",
+                        "arn:aws:dynamodb:*:*:table/netflix-llm-ab-config",
+                        "arn:aws:dynamodb:*:*:table/netflix-llm-feature-schemas"
+                    ]
+                },
+                {
+                    "Sid": "DecryptModelArtifacts",
+                    "Effect": "Allow",
+                    "Action": [
+                        "kms:Decrypt",
+                        "kms:DescribeKey",
+                        "kms:GenerateDataKey"
+                    ],
+                    "Resource": [
+                        "arn:aws:kms:*:*:key/*"
+                    ],
+                    "Condition": {
+                        "StringEquals": {
+                            "kms:ViaService": [
+                                "s3.us-east-1.amazonaws.com",
+                                "s3.us-west-2.amazonaws.com",
+                                "s3.eu-west-1.amazonaws.com"
+                            ]
+                        },
+                        "ForAnyValue:StringLike": {
+                            "kms:ResourceAliases": "alias/netflix-llm-*"
+                        }
+                    }
+                },
+                {
+                    "Sid": "ReadSecretsForInference",
+                    "Effect": "Allow",
+                    "Action": [
+                        "secretsmanager:GetSecretValue",
+                        "secretsmanager:DescribeSecret"
+                    ],
+                    "Resource": [
+                        "arn:aws:secretsmanager:*:*:secret:netflix-llm/inference/*"
+                    ]
+                },
+                {
+                    "Sid": "PublishInferenceMetrics",
+                    "Effect": "Allow",
+                    "Action": [
+                        "cloudwatch:PutMetricData"
+                    ],
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "cloudwatch:namespace": [
+                                "Netflix/LLMInference",
+                                "Netflix/GPUMetrics"
+                            ]
+                        }
+                    }
+                },
+                {
+                    "Sid": "WriteInferenceLogs",
+                    "Effect": "Allow",
+                    "Action": [
+                        "logs:CreateLogStream",
+                        "logs:PutLogEvents",
+                        "logs:DescribeLogStreams"
+                    ],
+                    "Resource": [
+                        "arn:aws:logs:*:*:log-group:/netflix/llm-inference/*"
+                    ]
+                },
+                {
+                    "Sid": "PublishInferenceEvents",
+                    "Effect": "Allow",
+                    "Action": [
+                        "kinesis:PutRecord",
+                        "kinesis:PutRecords"
+                    ],
+                    "Resource": [
+                        "arn:aws:kinesis:*:*:stream/netflix-llm-inference-events",
+                        "arn:aws:kinesis:*:*:stream/netflix-llm-prediction-log"
+                    ]
+                },
+                {
+                    "Sid": "DescribeGPUInstances",
+                    "Effect": "Allow",
+                    "Action": [
+                        "ec2:DescribeInstances",
+                        "ec2:DescribeInstanceStatus"
+                    ],
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "ec2:ResourceTag/project": "netflix-llm-inference"
+                        }
+                    }
                 }
-            }
-        },
-        {
-            "Sid": "ECTPWriteS3Buckets",
-            "Effect": "Allow",
-            "Action": [
-                "s3:PutObject",
-                "s3:DeleteObject"
-            ],
-            "Resource": [
-                "arn:aws:s3:::ectp-data-*/*",
-                "arn:aws:s3:::ectp-logs-*/*"
             ]
         },
-        {
-            "Sid": "ECTPSecretsManager",
-            "Effect": "Allow",
-            "Action": [
-                "secretsmanager:GetSecretValue",
-                "secretsmanager:DescribeSecret"
-            ],
-            "Resource": [
-                "arn:aws:secretsmanager:us-east-1:*:secret:ectp/*"
-            ]
-        },
-        {
-            "Sid": "ECTPCloudWatchLogs",
-            "Effect": "Allow",
-            "Action": [
-                "logs:CreateLogGroup",
-                "logs:CreateLogStream",
-                "logs:PutLogEvents",
-                "logs:DescribeLogStreams"
-            ],
-            "Resource": [
-                "arn:aws:logs:us-east-1:*:log-group:/ectp/*"
-            ]
-        },
-        {
-            "Sid": "ECTPCloudWatchMetrics",
-            "Effect": "Allow",
-            "Action": [
-                "cloudwatch:PutMetricData",
-                "cloudwatch:GetMetricData",
-                "cloudwatch:ListMetrics"
-            ],
-            "Resource": "*",
-            "Condition": {
-                "StringEquals": {
-                    "cloudwatch:namespace": "ECTP"
-                }
-            }
-        },
-        {
-            "Sid": "ECTPSQS",
-            "Effect": "Allow",
-            "Action": [
-                "sqs:SendMessage",
-                "sqs:ReceiveMessage",
-                "sqs:DeleteMessage",
-                "sqs:GetQueueAttributes"
-            ],
-            "Resource": [
-                "arn:aws:sqs:us-east-1:*:ectp-*"
-            ]
-        },
-        {
-            "Sid": "ECTPSNS",
-            "Effect": "Allow",
-            "Action": [
-                "sns:Publish"
-            ],
-            "Resource": [
-                "arn:aws:sns:us-east-1:*:ectp-*"
-            ]
-        },
-        {
-            "Sid": "ECTPKMS",
-            "Effect": "Allow",
-            "Action": [
-                "kms:Decrypt",
-                "kms:GenerateDataKey"
-            ],
-            "Resource": [
-                "arn:aws:kms:us-east-1:*:key/*"
-            ],
-            "Condition": {
-                "StringEquals": {
-                    "kms:ViaService": [
-                        "s3.us-east-1.amazonaws.com",
-                        "secretsmanager.us-east-1.amazonaws.com",
-                        "rds.us-east-1.amazonaws.com"
+        "monitoring-service": {
+            "_description": "IAM policy for the monitoring and observability stack. Grants read access to metrics, logs, and health status across the inference fleet.",
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "ReadCloudWatchMetrics",
+                    "Effect": "Allow",
+                    "Action": [
+                        "cloudwatch:GetMetricData",
+                        "cloudwatch:GetMetricStatistics",
+                        "cloudwatch:ListMetrics",
+                        "cloudwatch:DescribeAlarms",
+                        "cloudwatch:GetDashboard",
+                        "cloudwatch:ListDashboards"
+                    ],
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "cloudwatch:namespace": [
+                                "Netflix/LLMInference",
+                                "Netflix/GPUMetrics",
+                                "AWS/EKS",
+                                "ContainerInsights"
+                            ]
+                        }
+                    }
+                },
+                {
+                    "Sid": "ReadCloudWatchLogs",
+                    "Effect": "Allow",
+                    "Action": [
+                        "logs:GetLogEvents",
+                        "logs:FilterLogEvents",
+                        "logs:DescribeLogGroups",
+                        "logs:DescribeLogStreams",
+                        "logs:StartQuery",
+                        "logs:GetQueryResults"
+                    ],
+                    "Resource": [
+                        "arn:aws:logs:*:*:log-group:/netflix/llm-*"
+                    ]
+                },
+                {
+                    "Sid": "ManageCloudWatchAlarms",
+                    "Effect": "Allow",
+                    "Action": [
+                        "cloudwatch:PutMetricAlarm",
+                        "cloudwatch:DeleteAlarms",
+                        "cloudwatch:SetAlarmState"
+                    ],
+                    "Resource": [
+                        "arn:aws:cloudwatch:*:*:alarm:netflix-llm-*"
+                    ]
+                },
+                {
+                    "Sid": "DescribeEKSClusters",
+                    "Effect": "Allow",
+                    "Action": [
+                        "eks:DescribeCluster",
+                        "eks:ListClusters",
+                        "eks:ListNodegroups",
+                        "eks:DescribeNodegroup"
+                    ],
+                    "Resource": [
+                        "arn:aws:eks:*:*:cluster/netflix-llm-*"
+                    ]
+                },
+                {
+                    "Sid": "ReadHealthCheckData",
+                    "Effect": "Allow",
+                    "Action": [
+                        "elasticloadbalancing:DescribeTargetHealth",
+                        "elasticloadbalancing:DescribeTargetGroups"
+                    ],
+                    "Resource": "*"
+                },
+                {
+                    "Sid": "PublishSNSAlerts",
+                    "Effect": "Allow",
+                    "Action": [
+                        "sns:Publish"
+                    ],
+                    "Resource": [
+                        "arn:aws:sns:*:*:netflix-llm-alerts-*"
                     ]
                 }
-            }
+            ]
         },
-        {
-            "Sid": "ECTPCostExplorer",
-            "Effect": "Allow",
-            "Action": [
-                "ce:GetCostAndUsage",
-                "ce:GetCostForecast",
-                "ce:GetReservationUtilization"
-            ],
-            "Resource": "*"
+        "deployment-pipeline": {
+            "_description": "IAM policy for the CI/CD deployment pipeline. Grants permissions to build images, push to ECR, update EKS deployments, and manage canary rollouts.",
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "ECRPushPull",
+                    "Effect": "Allow",
+                    "Action": [
+                        "ecr:GetAuthorizationToken"
+                    ],
+                    "Resource": "*"
+                },
+                {
+                    "Sid": "ECRManageImages",
+                    "Effect": "Allow",
+                    "Action": [
+                        "ecr:BatchCheckLayerAvailability",
+                        "ecr:GetDownloadUrlForLayer",
+                        "ecr:BatchGetImage",
+                        "ecr:PutImage",
+                        "ecr:InitiateLayerUpload",
+                        "ecr:UploadLayerPart",
+                        "ecr:CompleteLayerUpload",
+                        "ecr:DescribeRepositories",
+                        "ecr:DescribeImages",
+                        "ecr:ListImages",
+                        "ecr:DescribeImageScanFindings"
+                    ],
+                    "Resource": [
+                        "arn:aws:ecr:*:*:repository/netflix/llm-inference",
+                        "arn:aws:ecr:*:*:repository/netflix/llm-*"
+                    ]
+                },
+                {
+                    "Sid": "EKSDeployAccess",
+                    "Effect": "Allow",
+                    "Action": [
+                        "eks:DescribeCluster",
+                        "eks:ListClusters",
+                        "eks:UpdateClusterConfig",
+                        "eks:DescribeUpdate"
+                    ],
+                    "Resource": [
+                        "arn:aws:eks:*:*:cluster/netflix-llm-*"
+                    ]
+                },
+                {
+                    "Sid": "UploadModelArtifacts",
+                    "Effect": "Allow",
+                    "Action": [
+                        "s3:PutObject",
+                        "s3:GetObject",
+                        "s3:ListBucket",
+                        "s3:DeleteObject"
+                    ],
+                    "Resource": [
+                        "arn:aws:s3:::netflix-llm-models-*",
+                        "arn:aws:s3:::netflix-llm-models-*/*",
+                        "arn:aws:s3:::netflix-llm-deploy-artifacts-*",
+                        "arn:aws:s3:::netflix-llm-deploy-artifacts-*/*"
+                    ]
+                },
+                {
+                    "Sid": "UpdateModelRegistry",
+                    "Effect": "Allow",
+                    "Action": [
+                        "dynamodb:PutItem",
+                        "dynamodb:UpdateItem",
+                        "dynamodb:GetItem",
+                        "dynamodb:Query"
+                    ],
+                    "Resource": [
+                        "arn:aws:dynamodb:*:*:table/netflix-llm-model-registry",
+                        "arn:aws:dynamodb:*:*:table/netflix-llm-model-registry/index/*"
+                    ]
+                },
+                {
+                    "Sid": "EncryptArtifacts",
+                    "Effect": "Allow",
+                    "Action": [
+                        "kms:Encrypt",
+                        "kms:Decrypt",
+                        "kms:GenerateDataKey",
+                        "kms:DescribeKey"
+                    ],
+                    "Resource": [
+                        "arn:aws:kms:*:*:key/*"
+                    ],
+                    "Condition": {
+                        "ForAnyValue:StringLike": {
+                            "kms:ResourceAliases": "alias/netflix-llm-*"
+                        }
+                    }
+                },
+                {
+                    "Sid": "DeploymentLogging",
+                    "Effect": "Allow",
+                    "Action": [
+                        "logs:CreateLogGroup",
+                        "logs:CreateLogStream",
+                        "logs:PutLogEvents"
+                    ],
+                    "Resource": [
+                        "arn:aws:logs:*:*:log-group:/netflix/llm-deployment/*"
+                    ]
+                },
+                {
+                    "Sid": "GetCallerIdentity",
+                    "Effect": "Allow",
+                    "Action": [
+                        "sts:GetCallerIdentity"
+                    ],
+                    "Resource": "*"
+                }
+            ]
+        },
+        "data-scientist": {
+            "_description": "IAM policy for data scientists. Grants read-only access to model artifacts, inference logs, and metrics for analysis. No write access to production resources.",
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "ReadModelArtifacts",
+                    "Effect": "Allow",
+                    "Action": [
+                        "s3:GetObject",
+                        "s3:ListBucket",
+                        "s3:GetObjectVersion"
+                    ],
+                    "Resource": [
+                        "arn:aws:s3:::netflix-llm-models-*",
+                        "arn:aws:s3:::netflix-llm-models-*/*",
+                        "arn:aws:s3:::netflix-llm-inference-logs-*",
+                        "arn:aws:s3:::netflix-llm-inference-logs-*/*",
+                        "arn:aws:s3:::netflix-llm-training-data-*",
+                        "arn:aws:s3:::netflix-llm-training-data-*/*"
+                    ]
+                },
+                {
+                    "Sid": "UploadToStagingOnly",
+                    "Effect": "Allow",
+                    "Action": [
+                        "s3:PutObject",
+                        "s3:DeleteObject"
+                    ],
+                    "Resource": [
+                        "arn:aws:s3:::netflix-llm-models-staging/*",
+                        "arn:aws:s3:::netflix-llm-experiments-*/*"
+                    ]
+                },
+                {
+                    "Sid": "ReadModelRegistry",
+                    "Effect": "Allow",
+                    "Action": [
+                        "dynamodb:GetItem",
+                        "dynamodb:Query",
+                        "dynamodb:Scan"
+                    ],
+                    "Resource": [
+                        "arn:aws:dynamodb:*:*:table/netflix-llm-model-registry",
+                        "arn:aws:dynamodb:*:*:table/netflix-llm-model-registry/index/*",
+                        "arn:aws:dynamodb:*:*:table/netflix-llm-ab-config",
+                        "arn:aws:dynamodb:*:*:table/netflix-llm-experiment-results"
+                    ]
+                },
+                {
+                    "Sid": "ReadInferenceMetrics",
+                    "Effect": "Allow",
+                    "Action": [
+                        "cloudwatch:GetMetricData",
+                        "cloudwatch:GetMetricStatistics",
+                        "cloudwatch:ListMetrics"
+                    ],
+                    "Resource": "*"
+                },
+                {
+                    "Sid": "ReadInferenceLogs",
+                    "Effect": "Allow",
+                    "Action": [
+                        "logs:GetLogEvents",
+                        "logs:FilterLogEvents",
+                        "logs:StartQuery",
+                        "logs:GetQueryResults"
+                    ],
+                    "Resource": [
+                        "arn:aws:logs:*:*:log-group:/netflix/llm-inference/*"
+                    ]
+                },
+                {
+                    "Sid": "UseSageMakerNotebooks",
+                    "Effect": "Allow",
+                    "Action": [
+                        "sagemaker:CreateNotebookInstance",
+                        "sagemaker:StartNotebookInstance",
+                        "sagemaker:StopNotebookInstance",
+                        "sagemaker:DescribeNotebookInstance",
+                        "sagemaker:CreateTrainingJob",
+                        "sagemaker:DescribeTrainingJob",
+                        "sagemaker:ListTrainingJobs"
+                    ],
+                    "Resource": [
+                        "arn:aws:sagemaker:*:*:notebook-instance/netflix-llm-*",
+                        "arn:aws:sagemaker:*:*:training-job/netflix-llm-*"
+                    ]
+                },
+                {
+                    "Sid": "DecryptDataForAnalysis",
+                    "Effect": "Allow",
+                    "Action": [
+                        "kms:Decrypt",
+                        "kms:DescribeKey"
+                    ],
+                    "Resource": [
+                        "arn:aws:kms:*:*:key/*"
+                    ],
+                    "Condition": {
+                        "ForAnyValue:StringLike": {
+                            "kms:ResourceAliases": "alias/netflix-llm-*"
+                        }
+                    }
+                },
+                {
+                    "Sid": "DenyProductionWrites",
+                    "Effect": "Deny",
+                    "Action": [
+                        "s3:PutObject",
+                        "s3:DeleteObject"
+                    ],
+                    "Resource": [
+                        "arn:aws:s3:::netflix-llm-models-prod/*"
+                    ]
+                }
+            ]
         }
-    ]
+    }
 }

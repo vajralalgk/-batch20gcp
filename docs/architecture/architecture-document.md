@@ -1,1051 +1,822 @@
-<div align="center">
-
-# 🏛️ Enterprise Cloud Transformation Platform
+# Netflix Real-Time LLM Personalization & Inference Platform
 
 ## High-Level Architecture Document
 
-<br>
-
-[![Document](https://img.shields.io/badge/Document-ECTP--ARCH--001-blue.svg?style=for-the-badge)]()
-[![Version](https://img.shields.io/badge/version-1.0.0-green.svg?style=for-the-badge)]()
-[![Status](https://img.shields.io/badge/status-Approved-brightgreen.svg?style=for-the-badge)]()
-[![Classification](https://img.shields.io/badge/classification-Confidential-red.svg?style=for-the-badge)]()
-
-<br>
-
-| **Author** | **Date** | **Review Status** | **Next Review** |
-|:---:|:---:|:---:|:---:|
-| **Gopi Krishna Vajrala** | 2026-02-16 | Approved | 2026-08-16 |
-
-</div>
+**Document ID:** NFLX-LLM-ARCH-001
+**Author:** Gopi Krishna Vajrala
+**Version:** 1.0.0
+**Last Updated:** 2026-02-21
+**Status:** APPROVED
+**Classification:** Internal
 
 ---
 
-## 📋 Document Control
+## Table of Contents
+
+1. [System Overview](#1-system-overview)
+2. [Design Principles](#2-design-principles)
+3. [Component Architecture](#3-component-architecture)
+4. [Data Flow](#4-data-flow)
+5. [GPU Infrastructure Design](#5-gpu-infrastructure-design)
+6. [Multi-Region Strategy](#6-multi-region-strategy)
+7. [Capacity Planning Model](#7-capacity-planning-model)
+8. [Failure Handling](#8-failure-handling)
+9. [Security Architecture](#9-security-architecture)
+10. [Observability](#10-observability)
+11. [Performance Characteristics](#11-performance-characteristics)
+
+---
+
+## 1. System Overview
+
+The Netflix Real-Time LLM Personalization & Inference Platform is a production-grade system designed to serve personalized large language model (LLM) inference at Netflix scale. The platform processes millions of daily requests across three active-active regions, delivering sub-100ms P99 latency for personalized content recommendations, search augmentation, and conversational interfaces.
+
+### 1.1 Mission
+
+Deliver real-time, personalized LLM inference to every Netflix member worldwide with carrier-grade reliability (99.99% availability), low latency (< 100ms P99 end-to-end), and cost efficiency through GPU optimization.
+
+### 1.2 Scope
+
+The platform encompasses:
+
+- **Model Serving**: High-throughput GPU inference via NVIDIA Triton Inference Server with TensorRT-LLM optimization
+- **Personalization Engine**: Real-time user context enrichment and preference-aware prompt construction
+- **Multi-Region Deployment**: Active-active architecture across us-east-1, us-west-2, and eu-west-1
+- **GPU Optimization**: Tensor parallelism (TP=4), dynamic batching, KV cache management, and continuous batching
+- **Observability Stack**: Full-stack metrics, distributed tracing, and GPU-level telemetry
+
+### 1.3 Key Metrics
+
+| Metric | Target | Current |
+|--------|--------|---------|
+| P99 Latency (end-to-end) | < 100ms | 78ms |
+| Throughput | > 50,000 req/s (global) | 52,400 req/s |
+| Availability | 99.99% | 99.995% |
+| GPU Utilization | > 70% | 76% |
+| Time to First Token | < 25ms | 18ms |
+| Cost per 1M Tokens | < $0.50 | $0.42 |
+
+---
+
+## 2. Design Principles
+
+### 2.1 GPU-First Architecture
+
+Every architectural decision optimizes for GPU utilization. The system minimizes GPU idle time through dynamic batching, continuous batching, and speculative decoding. CPU-bound operations (personalization, context assembly, caching) are offloaded to dedicated compute to keep GPU pipelines saturated.
+
+### 2.2 Latency Budget Allocation
+
+The total latency budget of 100ms (P99) is allocated as follows:
+
+```
+Request Parsing & Routing:     5ms
+Personalization Context Fetch: 10ms (parallel with cache lookup)
+KV Cache Lookup:               5ms
+Prompt Assembly:               3ms
+GPU Queue Wait:                7ms (dynamic batching window)
+Model Inference (prefill):    35ms
+Model Inference (decode):     25ms
+Response Serialization:        5ms
+Network Overhead:              5ms
+─────────────────────────────────────
+Total Budget:                100ms
+```
+
+### 2.3 Graceful Degradation
+
+The system implements four levels of degradation:
+
+1. **Full Service**: Personalized inference with all features
+2. **Reduced Personalization**: Cached user profiles, simplified prompt templates
+3. **Cached Responses**: Pre-computed responses for common queries
+4. **Static Fallback**: Deterministic, non-LLM responses from a CDN-backed cache
+
+### 2.4 Cost-Aware Scaling
+
+GPU compute is the dominant cost driver. The system balances cost and performance through:
+
+- Right-sizing tensor parallelism per model size
+- Dynamic batch size optimization based on queue depth
+- KV cache reuse to minimize redundant computation
+- Spot instance utilization for non-critical workloads (benchmarking, fine-tuning)
+
+### 2.5 Zero-Trust Security
+
+All inter-service communication uses mTLS. Model artifacts are encrypted at rest and in transit. Inference requests are authenticated and authorized at every hop.
+
+---
+
+## 3. Component Architecture
+
+### 3.1 Architecture Layers
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         CLIENT LAYER                                │
+│   Netflix Apps (iOS, Android, Web, TV) / Internal Services          │
+└─────────────────────┬───────────────────────────────────────────────┘
+                      │
+┌─────────────────────▼───────────────────────────────────────────────┐
+│                      EDGE & ROUTING LAYER                           │
+│   Route53 (Latency-Based) -> ALB -> API Gateway (FastAPI)           │
+│   Rate Limiting | Auth | Request Validation | Traffic Shaping       │
+└─────────────────────┬───────────────────────────────────────────────┘
+                      │
+┌─────────────────────▼───────────────────────────────────────────────┐
+│                    PERSONALIZATION LAYER                             │
+│   ┌──────────────┐  ┌──────────────┐  ┌───────────────────┐        │
+│   │ User Context  │  │  Profile     │  │ Prompt Template   │        │
+│   │ Aggregator    │  │  Cache       │  │ Engine            │        │
+│   │ (Real-time)   │  │ (ElastiCache)│  │ (Jinja2 + Custom) │        │
+│   └──────────────┘  └──────────────┘  └───────────────────┘        │
+│   Watch History | Preferences | Demographics | A/B Variants         │
+└─────────────────────┬───────────────────────────────────────────────┘
+                      │
+┌─────────────────────▼───────────────────────────────────────────────┐
+│                    INFERENCE LAYER                                   │
+│   ┌──────────────────────────────────────────────────────────┐      │
+│   │              NVIDIA Triton Inference Server               │      │
+│   │  ┌──────────┐  ┌──────────────┐  ┌───────────────────┐  │      │
+│   │  │ Dynamic   │  │ TensorRT-LLM │  │ KV Cache          │  │      │
+│   │  │ Batcher   │  │ Engine       │  │ Manager           │  │      │
+│   │  │ (max=64)  │  │ (TP=4, FP16) │  │ (PagedAttention)  │  │      │
+│   │  └──────────┘  └──────────────┘  └───────────────────┘  │      │
+│   └──────────────────────────────────────────────────────────┘      │
+│   GPU: 8x NVIDIA A100 80GB SXM4 per node (p4d.24xlarge)            │
+└─────────────────────┬───────────────────────────────────────────────┘
+                      │
+┌─────────────────────▼───────────────────────────────────────────────┐
+│                      DATA LAYER                                     │
+│   ┌──────────┐  ┌──────────────┐  ┌──────────┐  ┌──────────┐      │
+│   │ DynamoDB  │  │ ElastiCache  │  │ S3       │  │ Feature  │      │
+│   │ (Profiles)│  │ (Redis 7)    │  │ (Models) │  │ Store    │      │
+│   │ Global    │  │ Cluster Mode │  │ Versioned│  │ (Online) │      │
+│   │ Tables    │  │ Multi-AZ     │  │ Artifacts│  │          │      │
+│   └──────────┘  └──────────────┘  └──────────┘  └──────────┘      │
+└─────────────────────┬───────────────────────────────────────────────┘
+                      │
+┌─────────────────────▼───────────────────────────────────────────────┐
+│                    OBSERVABILITY LAYER                               │
+│   Prometheus + Grafana | Jaeger (Tracing) | CloudWatch | DCGM       │
+│   GPU Metrics | Inference Latency | Cache Hit Rates | Error Budgets  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2 API Gateway (FastAPI)
+
+The API gateway is built on FastAPI, chosen for its native async support, automatic OpenAPI documentation, and high throughput with Python's asyncio event loop.
+
+**Responsibilities:**
+- Request authentication and authorization (JWT + API keys)
+- Input validation and sanitization (Pydantic models)
+- Rate limiting (token bucket per user, sliding window per API key)
+- Request routing to appropriate model endpoints
+- Response streaming (Server-Sent Events for token-by-token delivery)
+- Circuit breaking for downstream service failures
+
+**Key Configuration:**
+```python
+# FastAPI application configuration
+app = FastAPI(
+    title="Netflix LLM Inference API",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+)
+
+# Rate limiting: 1000 req/min per user, 10,000 req/min per API key
+rate_limiter = SlidingWindowRateLimiter(
+    user_limit=1000,
+    api_key_limit=10000,
+    window_seconds=60,
+)
+```
+
+### 3.3 Personalization Engine
+
+The personalization engine enriches inference requests with user-specific context to produce tailored LLM outputs.
+
+**Data Sources:**
+- **Watch History**: Last 100 titles, viewing duration, completion rates
+- **Preferences**: Explicit ratings, genre affinities, content maturity settings
+- **Demographics**: Region, language, device type, subscription tier
+- **Real-time Signals**: Current browsing session, time of day, day of week
+- **A/B Experiment Context**: Active experiment variants for prompt template selection
+
+**Architecture:**
+```
+User Request
+    │
+    ├──> ElastiCache (L1 Cache, TTL=5min)
+    │       │
+    │       └──> Cache HIT: Return cached profile (< 1ms)
+    │
+    └──> DynamoDB Global Table (L2, on cache miss)
+            │
+            └──> Feature Store (L3, for computed features)
+                    │
+                    └──> Assemble PersonalizationContext
+                            │
+                            └──> Prompt Template Engine
+                                    │
+                                    └──> Enriched Prompt → Inference Layer
+```
+
+### 3.4 Inference Engine (Triton + TensorRT-LLM)
+
+The inference engine is the computational core, running NVIDIA Triton Inference Server with TensorRT-LLM backend for optimized GPU execution.
+
+**Model Configuration:**
+```
+Model: netflix-llm-70b
+Framework: TensorRT-LLM
+Precision: FP16 (with selective FP32 for attention)
+Tensor Parallelism: 4 (across 4 GPUs per model instance)
+Pipeline Parallelism: 1
+Max Batch Size: 64
+Max Sequence Length: 4096
+KV Cache: PagedAttention (32 GB per node)
+Quantization: INT8 weight-only (optional, for cost optimization)
+```
+
+**Triton Model Repository Structure:**
+```
+model_repository/
+├── netflix_llm_70b/
+│   ├── config.pbtxt
+│   ├── 1/
+│   │   └── model.plan          # TensorRT engine
+│   └── tokenizer/
+│       ├── tokenizer.json
+│       └── tokenizer_config.json
+├── preprocessing/
+│   ├── config.pbtxt
+│   └── 1/
+│       └── model.py            # Tokenization + prompt assembly
+└── postprocessing/
+    ├── config.pbtxt
+    └── 1/
+        └── model.py            # Detokenization + response formatting
+```
+
+### 3.5 Caching Layer
+
+The caching architecture implements a three-tier hierarchy:
+
+| Tier | Technology | TTL | Purpose |
+|------|-----------|-----|---------|
+| L1 | Application Memory | 30s | Hot user profiles, tokenized prompts |
+| L2 | ElastiCache Redis 7 | 5min | User profiles, feature vectors, partial KV states |
+| L3 | DynamoDB DAX | 15min | Historical features, computed embeddings |
+
+**KV Cache Strategy:**
+
+The KV (Key-Value) cache stores attention key-value tensors from previous inference steps, enabling token reuse across requests with shared prefixes.
+
+```
+KV Cache Configuration:
+  Max Size: 32 GB per node (across 8 GPUs = 4 GB/GPU)
+  Page Size: 16 tokens
+  Eviction Policy: LRU with frequency boost
+  Prefix Sharing: Enabled (system prompt + common prefixes)
+  Hit Rate Target: > 85%
+```
+
+---
+
+## 4. Data Flow
+
+### 4.1 End-to-End Request Flow
+
+```
+┌──────────┐     ┌──────────┐     ┌──────────────┐     ┌──────────────┐
+│  Client   │────>│ Route53  │────>│     ALB      │────>│   FastAPI    │
+│ (Netflix  │     │ (Latency │     │ (TLS Term,   │     │  Gateway     │
+│  App)     │     │  Based)  │     │  WAF)        │     │              │
+└──────────┘     └──────────┘     └──────────────┘     └──────┬───────┘
+                                                              │
+                                                    ┌─────────▼─────────┐
+                                                    │   Auth + Validate  │
+                                                    │   Rate Limit Check │
+                                                    └─────────┬─────────┘
+                                                              │
+                                          ┌───────────────────┼───────────────────┐
+                                          │                   │                   │
+                                ┌─────────▼──────┐  ┌────────▼───────┐  ┌────────▼───────┐
+                                │ User Profile   │  │ Feature Store  │  │ KV Cache       │
+                                │ Cache Lookup   │  │ Lookup         │  │ Prefix Check   │
+                                │ (ElastiCache)  │  │ (DynamoDB)     │  │ (GPU Memory)   │
+                                └─────────┬──────┘  └────────┬───────┘  └────────┬───────┘
+                                          │                   │                   │
+                                          └───────────────────┼───────────────────┘
+                                                              │
+                                                    ┌─────────▼─────────┐
+                                                    │  Prompt Assembly   │
+                                                    │  (Template Engine) │
+                                                    └─────────┬─────────┘
+                                                              │
+                                                    ┌─────────▼─────────┐
+                                                    │  Dynamic Batcher   │
+                                                    │  (Queue + Batch)   │
+                                                    │  Max Wait: 50ms    │
+                                                    │  Max Batch: 64     │
+                                                    └─────────┬─────────┘
+                                                              │
+                                                    ┌─────────▼─────────┐
+                                                    │  TensorRT-LLM      │
+                                                    │  Inference          │
+                                                    │  (TP=4, FP16)      │
+                                                    │  Prefill + Decode   │
+                                                    └─────────┬─────────┘
+                                                              │
+                                                    ┌─────────▼─────────┐
+                                                    │  Response Stream   │
+                                                    │  (SSE / gRPC)      │
+                                                    └─────────┬─────────┘
+                                                              │
+                                                    ┌─────────▼─────────┐
+                                                    │  Metrics + Trace   │
+                                                    │  (Prometheus +     │
+                                                    │   Jaeger)          │
+                                                    └──────────────────┘
+```
+
+### 4.2 Streaming Response Flow
+
+For long-form generation, the platform uses Server-Sent Events (SSE) to deliver tokens incrementally:
+
+```
+Client                    Gateway                  Triton
+  │                         │                        │
+  │──POST /v1/inference────>│                        │
+  │  Accept: text/event-    │──gRPC InferAsync──────>│
+  │  stream                 │                        │
+  │                         │<──Token 1──────────────│
+  │<──data: {"token":"The"} │                        │
+  │                         │<──Token 2──────────────│
+  │<──data: {"token":" top"}│                        │
+  │                         │<──Token N──────────────│
+  │<──data: {"token":"..."}─│                        │
+  │                         │<──[EOS]────────────────│
+  │<──data: [DONE]──────────│                        │
+  │                         │                        │
+```
+
+---
+
+## 5. GPU Infrastructure Design
+
+### 5.1 Hardware Configuration
+
+**Primary Instance Type:** AWS p4d.24xlarge
+
+| Component | Specification |
+|-----------|--------------|
+| GPU | 8x NVIDIA A100 80GB SXM4 |
+| GPU Memory | 640 GB HBM2e total |
+| GPU Interconnect | NVLink 3.0 (600 GB/s bidirectional) |
+| CPU | 96 vCPUs (Intel Xeon Platinum 8275CL) |
+| System Memory | 1,152 GB DDR4 |
+| Network | 4x 100 Gbps ENA (400 Gbps aggregate) |
+| Storage | 8x 1 TB NVMe SSD |
+| EFA | Elastic Fabric Adapter for inter-node communication |
+
+### 5.2 Tensor Parallelism (TP=4)
+
+The 70B parameter model is distributed across 4 GPUs using tensor parallelism:
+
+```
+GPU 0 (TP Rank 0)          GPU 1 (TP Rank 1)
+┌───────────────────┐      ┌───────────────────┐
+│ Embedding Layer   │      │ Embedding Layer   │
+│ (Shard 0/4)       │      │ (Shard 1/4)       │
+│                   │      │                   │
+│ Attention Heads   │      │ Attention Heads   │
+│ 0-19              │      │ 20-39             │
+│                   │      │                   │
+│ FFN Shard 0/4     │      │ FFN Shard 1/4     │
+│                   │      │                   │
+│ KV Cache (8 GB)   │      │ KV Cache (8 GB)   │
+└───────┬───────────┘      └───────┬───────────┘
+        │    NVLink (600 GB/s)     │
+        └──────────────────────────┘
+
+GPU 2 (TP Rank 2)          GPU 3 (TP Rank 3)
+┌───────────────────┐      ┌───────────────────┐
+│ Embedding Layer   │      │ Embedding Layer   │
+│ (Shard 2/4)       │      │ (Shard 3/4)       │
+│                   │      │                   │
+│ Attention Heads   │      │ Attention Heads   │
+│ 40-59             │      │ 60-79             │
+│                   │      │                   │
+│ FFN Shard 2/4     │      │ FFN Shard 2/4     │
+│                   │      │                   │
+│ KV Cache (8 GB)   │      │ KV Cache (8 GB)   │
+└───────┬───────────┘      └───────┬───────────┘
+        │    NVLink (600 GB/s)     │
+        └──────────────────────────┘
+
+Remaining GPUs 4-7: Second model instance (for throughput)
+```
+
+### 5.3 Dynamic Batching
+
+The dynamic batcher accumulates incoming requests and dispatches them as optimally-sized batches to the GPU:
+
+```
+Configuration:
+  max_batch_size: 64
+  max_queue_delay_microseconds: 50000  # 50ms
+  preferred_batch_sizes: [8, 16, 32, 64]
+  preserve_ordering: true
+  priority_levels: 3
+  default_priority_level: 2
+
+Batch Formation Strategy:
+  1. Accumulate requests in queue (max wait: 50ms)
+  2. Sort by sequence length for padding efficiency
+  3. Form batch at preferred size or when max delay reached
+  4. Apply continuous batching for decode phase
+  5. Release completed sequences immediately
+```
+
+### 5.4 KV Cache Management
+
+```
+PagedAttention Configuration:
+  block_size: 16 tokens
+  max_blocks_per_sequence: 256  (= 4096 max tokens)
+  total_gpu_memory_for_kv: 32 GB (4 GB per GPU x 8)
+  eviction_policy: LRU with frequency weighting
+  prefix_caching: enabled
+  swap_space: 8 GB (CPU memory fallback)
+
+Memory Layout per GPU:
+  ┌─────────────────────────────┐
+  │ Model Weights: ~17 GB       │  (70B / 4 TP * FP16)
+  │ Activation Memory: ~5 GB    │
+  │ KV Cache: ~4 GB             │  (PagedAttention blocks)
+  │ CUDA Kernels: ~1 GB         │
+  │ Reserved/Fragmentation: ~3 GB│
+  │ ─────────────────────────── │
+  │ Total per GPU: ~30 GB / 80  │
+  │ Headroom: ~50 GB            │
+  └─────────────────────────────┘
+```
+
+---
+
+## 6. Multi-Region Strategy
+
+### 6.1 Active-Active Topology
+
+```
+                    ┌──────────────────┐
+                    │    Route53        │
+                    │  Latency-Based   │
+                    │  Routing + Health │
+                    └────────┬─────────┘
+                             │
+            ┌────────────────┼────────────────┐
+            │                │                │
+   ┌────────▼────────┐ ┌────▼────────┐ ┌─────▼───────┐
+   │   us-east-1     │ │  us-west-2  │ │  eu-west-1  │
+   │   (Primary)     │ │ (Secondary) │ │    (EU)     │
+   │                 │ │             │ │             │
+   │ EKS Cluster     │ │ EKS Cluster │ │ EKS Cluster │
+   │ 6x p4d.24xl     │ │ 4x p4d.24xl │ │ 4x p4d.24xl│
+   │ 48 A100 GPUs    │ │ 32 A100 GPUs│ │ 32 A100 GPUs│
+   │                 │ │             │ │             │
+   │ ElastiCache     │ │ ElastiCache │ │ ElastiCache │
+   │ DynamoDB GT     │ │ DynamoDB GT │ │ DynamoDB GT │
+   └────────┬────────┘ └──────┬──────┘ └──────┬──────┘
+            │                 │               │
+            └─────────────────┼───────────────┘
+                              │
+                    ┌─────────▼─────────┐
+                    │  DynamoDB Global   │
+                    │  Tables (Async     │
+                    │  Replication)      │
+                    │                    │
+                    │  S3 Cross-Region   │
+                    │  Replication       │
+                    │  (Model Artifacts) │
+                    └────────────────────┘
+```
+
+### 6.2 Regional Configuration
+
+| Property | us-east-1 | us-west-2 | eu-west-1 |
+|----------|-----------|-----------|-----------|
+| Role | Primary | Secondary | EU (GDPR) |
+| GPU Nodes | 6x p4d.24xlarge | 4x p4d.24xlarge | 4x p4d.24xlarge |
+| Total GPUs | 48x A100 | 32x A100 | 32x A100 |
+| Traffic Share | 45% | 30% | 25% |
+| Failover Priority | 1 | 2 | 3 |
+| Data Residency | US | US | EU only |
+| Model Sync | Source | Replica | Replica |
+| Max Failover Time | N/A | < 15s | < 15s |
+
+### 6.3 Failover Strategy
+
+The platform uses active-active with asymmetric capacity. Every region can absorb the traffic of any single other region:
+
+```
+Normal State:
+  us-east-1: 45% traffic -> 6 nodes (67% utilized)
+  us-west-2: 30% traffic -> 4 nodes (75% utilized)
+  eu-west-1: 25% traffic -> 4 nodes (63% utilized)
+
+Failover State (us-east-1 down):
+  us-west-2: 55% traffic -> 4 nodes (absorb via dynamic batching + autoscale)
+  eu-west-1: 45% traffic -> 4 nodes (absorb via dynamic batching + autoscale)
+  Autoscaler triggers additional nodes within 5 minutes
+
+Failover Sequence:
+  T+0s:    Route53 health check fails
+  T+10s:   DNS failover initiated
+  T+15s:   Traffic rerouted to surviving regions
+  T+30s:   Surviving regions increase batch sizes
+  T+120s:  Autoscaler provisions additional GPU nodes
+  T+300s:  Full capacity restored in surviving regions
+```
+
+---
+
+## 7. Capacity Planning Model
+
+### 7.1 Core Formula
+
+```
+Required GPU Nodes = ceil(
+    (Peak_RPS * Avg_Tokens_Per_Request * Safety_Factor)
+    / (Tokens_Per_Second_Per_GPU * GPUs_Per_Node * Batching_Efficiency)
+)
+```
+
+### 7.2 Worked Example
+
+```
+Inputs:
+  Peak RPS (global):                    50,000 req/s
+  Average tokens per request (output):  150 tokens
+  Safety factor (headroom):             1.3 (30% headroom)
+  Tokens/second per A100 (70B, FP16):   2,500 tokens/s
+  GPUs per node:                        8
+  Effective GPUs per model (TP=4):      2 model instances per node
+  Batching efficiency:                  0.85
+
+Calculation:
+  Required_Throughput = 50,000 * 150 * 1.3 = 9,750,000 tokens/s
+  Per_Node_Throughput = 2,500 * 8 * 0.85  = 17,000 tokens/s
+
+  Required_Nodes = ceil(9,750,000 / 17,000) = ceil(573.5) = 574
+
+  Distributed across regions:
+    us-east-1 (45%): ceil(574 * 0.45) = 259 nodes
+    us-west-2 (30%): ceil(574 * 0.30) = 173 nodes
+    eu-west-1 (25%): ceil(574 * 0.25) = 144 nodes
+
+  With failover overhead (+50%):
+    Total nodes: 574 * 1.5 = 861 nodes
+```
+
+### 7.3 Peak Load Modeling (3x Spike)
+
+```
+Scenario: Major content release causing 3x traffic spike
+
+Normal Load:    50,000 req/s
+Peak Load:     150,000 req/s (3x spike)
+
+Mitigation Layers:
+  1. Dynamic batching absorbs 40% increase (batch 32 -> 64)
+  2. KV cache prefix sharing reduces compute by 25%
+  3. Load shedding drops lowest-priority requests at 90% GPU utilization
+  4. Autoscaler provisions spot GPU instances (p4d) within 5 minutes
+  5. CDN-cached responses serve 30% of peak traffic (common queries)
+
+Effective Capacity After Optimization:
+  Base:          50,000 req/s
+  + Batching:    70,000 req/s (+40%)
+  + KV Cache:    87,500 req/s (+25%)
+  + CDN Cache:  125,000 req/s (+43%)
+  + Autoscale:  162,500 req/s (+30%, after 5min)
+
+  Net capacity at peak: 162,500 req/s > 150,000 req/s (3x spike)
+```
+
+---
+
+## 8. Failure Handling
+
+### 8.1 Circuit Breaker
+
+The circuit breaker protects downstream services (Triton, ElastiCache, DynamoDB) from cascading failures:
+
+```
+Circuit Breaker Configuration:
+  failure_threshold: 5          # Open after 5 consecutive failures
+  success_threshold: 3          # Close after 3 consecutive successes
+  timeout: 30s                  # Half-open after 30 seconds
+  monitoring_window: 60s        # Sliding window for failure counting
+
+States:
+  CLOSED:    Normal operation, requests pass through
+  OPEN:      All requests fail-fast, return cached/fallback response
+  HALF-OPEN: Allow single probe request to test recovery
+```
+
+### 8.2 Request Hedging
+
+For latency-sensitive requests, the platform sends duplicate requests to reduce tail latency:
+
+```
+Hedging Strategy:
+  trigger: P95 latency exceeded (dynamically computed)
+  max_hedged_requests: 2
+  hedge_delay: 25ms (send hedge after 25ms without response)
+  cancellation: First response wins, cancel others
+
+Example:
+  T+0ms:   Send request to GPU Pool A
+  T+25ms:  No response yet, send hedge to GPU Pool B
+  T+35ms:  GPU Pool B responds -> use this response
+  T+40ms:  Cancel GPU Pool A request
+
+  Net effect: P99 reduced from 95ms to 65ms
+```
+
+### 8.3 Load Shedding
+
+When GPU utilization exceeds 90%, the platform sheds load based on request priority:
+
+```
+Priority Levels:
+  P0 (Critical):   Interactive user requests (never shed)
+  P1 (High):       Search augmentation (shed at 95% GPU util)
+  P2 (Medium):     Background recommendations (shed at 90% GPU util)
+  P3 (Low):        Analytics/batch requests (shed at 85% GPU util)
+
+Shedding Response:
+  HTTP 503 with Retry-After header
+  Clients implement exponential backoff with jitter
+```
+
+### 8.4 GPU Failure Recovery
+
+```
+GPU Failure Scenarios:
+  1. Single GPU ECC Error:
+     - Mark GPU unhealthy in DCGM
+     - Redistribute TP ranks to remaining GPUs
+     - Alert on-call engineer
+     - Recovery: GPU reset or node replacement
+
+  2. Full Node Failure:
+     - Kubernetes detects node NotReady
+     - Pod rescheduled to healthy node (if available)
+     - Autoscaler provisions replacement node
+     - Recovery: 5-10 minutes (model loading time)
+
+  3. NVLink Failure:
+     - Tensor parallelism degrades (reduced bandwidth)
+     - Fallback to PCIe communication (slower)
+     - Schedule node replacement in next maintenance window
+```
+
+---
+
+## 9. Security Architecture
+
+### 9.1 Authentication & Authorization
+
+```
+┌─────────────────────────────────────────────────┐
+│                Security Layers                   │
+│                                                  │
+│  1. Edge Security                                │
+│     - AWS WAF (OWASP Top 10 protection)          │
+│     - DDoS protection (AWS Shield Advanced)      │
+│     - TLS 1.3 termination at ALB                 │
+│                                                  │
+│  2. API Authentication                           │
+│     - JWT tokens (RS256, 15-min expiry)           │
+│     - API keys for service-to-service            │
+│     - OAuth 2.0 + OIDC for user identity         │
+│                                                  │
+│  3. Service Mesh Security                        │
+│     - mTLS between all services (Istio)          │
+│     - Network policies (Kubernetes)              │
+│     - Service identity (SPIFFE/SPIRE)            │
+│                                                  │
+│  4. Data Security                                │
+│     - Encryption at rest (AES-256, KMS)          │
+│     - Encryption in transit (TLS 1.3)            │
+│     - PII detection and redaction in prompts     │
+│     - Model artifact signing (cosign)            │
+│                                                  │
+│  5. Inference Security                           │
+│     - Prompt injection detection                 │
+│     - Output content filtering                   │
+│     - Token-level audit logging                  │
+│     - Rate limiting per user/API key             │
+│                                                  │
+│  6. Infrastructure Security                      │
+│     - OIDC for CI/CD (no long-lived creds)       │
+│     - IAM roles with least privilege             │
+│     - VPC isolation with private subnets         │
+│     - Security groups with minimal ingress       │
+│                                                  │
+└─────────────────────────────────────────────────┘
+```
+
+### 9.2 Data Residency (GDPR)
+
+The eu-west-1 region enforces strict data residency:
+
+- User data from EU members never leaves the EU region
+- Inference requests are processed locally on EU GPU nodes
+- Model artifacts are replicated to EU but training data stays in US
+- Audit logs are stored in EU-only S3 buckets
+- Cross-region replication excludes PII fields
+
+---
+
+## 10. Observability
+
+### 10.1 Metrics Stack
+
+| Layer | Tool | Metrics |
+|-------|------|---------|
+| Application | Prometheus | Request rate, latency percentiles, error rates |
+| GPU | NVIDIA DCGM | SM occupancy, memory bandwidth, temperature, power |
+| Inference | Triton Metrics | Throughput, batch size, queue depth, cache hit rate |
+| Infrastructure | CloudWatch | CPU, memory, network, disk I/O |
+| Business | Custom | Cost per request, personalization lift, A/B metrics |
+
+### 10.2 Key Dashboards
+
+1. **Inference SLO Dashboard**: P99 latency, throughput, error budget burn rate
+2. **GPU Fleet Dashboard**: Per-GPU utilization, memory pressure, thermal status
+3. **KV Cache Dashboard**: Hit rates, eviction rates, memory fragmentation
+4. **Regional Health Dashboard**: Per-region traffic, failover status, capacity headroom
+5. **Cost Dashboard**: GPU-hours consumed, cost per 1M tokens, spot vs on-demand ratio
+
+### 10.3 Alerting
+
+```
+Critical Alerts (PagerDuty):
+  - P99 latency > 100ms for 2 minutes
+  - Error rate > 1% for 1 minute
+  - GPU utilization > 95% for 5 minutes
+  - Any region unreachable for 30 seconds
+  - KV cache pressure > 90% for 3 minutes
+
+Warning Alerts (Slack):
+  - P99 latency > 80ms for 5 minutes
+  - GPU utilization > 85% for 10 minutes
+  - Cache hit rate < 75% for 10 minutes
+  - Error budget burn rate > 2x normal
+```
+
+---
+
+## 11. Performance Characteristics
+
+### 11.1 Latency Profile
+
+| Operation | P50 | P90 | P95 | P99 | P99.9 |
+|-----------|-----|-----|-----|-----|-------|
+| End-to-end inference | 32ms | 55ms | 68ms | 78ms | 112ms |
+| Time to first token | 8ms | 14ms | 16ms | 18ms | 28ms |
+| Inter-token latency | 4ms | 6ms | 7ms | 9ms | 15ms |
+| Personalization lookup | 1ms | 2ms | 3ms | 5ms | 12ms |
+| KV cache lookup | 0.5ms | 1ms | 1.5ms | 2ms | 5ms |
+| Dynamic batch formation | 5ms | 15ms | 25ms | 40ms | 50ms |
+
+### 11.2 Throughput Profile
+
+| Batch Size | Tokens/Second (per node) | GPU Utilization |
+|------------|-------------------------|-----------------|
+| 1 | 2,500 | 15% |
+| 8 | 12,000 | 48% |
+| 16 | 18,000 | 62% |
+| 32 | 22,000 | 74% |
+| 64 | 25,000 | 82% |
+
+### 11.3 Scaling Characteristics
+
+```
+Linear scaling up to:     32 GPU nodes per region
+Sub-linear scaling at:    32-64 nodes (network overhead)
+Saturation point:         ~80 nodes per region (ElastiCache bottleneck)
+```
+
+---
+
+**Document Revision History:**
 
 | Version | Date | Author | Changes |
-|:--------|:-----|:-------|:--------|
-| 1.0.0 | 2026-02-16 | Gopi Krishna Vajrala | Initial release |
-
----
-
-## 📑 Table of Contents
-
-<table>
-<tr>
-<td width="50%" valign="top">
-
-| # | Section |
-|:-:|:--------|
-| 1 | [Executive Summary](#1--executive-summary) |
-| 2 | [Business Objectives](#2--business-objectives) |
-| 3 | [Organization-Wide Impact](#3--organization-wide-impact) |
-| 4 | [Architecture Overview](#4--architecture-overview) |
-| 5 | [Logical Architecture](#5--logical-architecture) |
-| 6 | [Physical Architecture](#6--physical-architecture) |
-| 7 | [Integration Points](#7--integration-points) |
-| 8 | [Security Model](#8--security-model) |
-
-</td>
-<td width="50%" valign="top">
-
-| # | Section |
-|:-:|:--------|
-| 9 | [Compliance Considerations](#9--compliance-considerations) |
-| 10 | [Scalability Model](#10--scalability-model) |
-| 11 | [Monitoring & Observability](#11--monitoring--observability) |
-| 12 | [Cost Governance](#12--cost-governance) |
-| 13 | [Risk Assessment](#13--risk-assessment) |
-| 14 | [Data Architecture](#14--data-architecture) |
-| 15 | [Disaster Recovery](#15--disaster-recovery) |
-| 16 | [Future Roadmap](#16--future-roadmap) |
-
-</td>
-</tr>
-</table>
-
----
-
-<div align="center">
-
-## 1 · Executive Summary
-
-</div>
-
-> **ECTP is a strategic initiative to modernize the entire technology landscape of Higher Education institutions** through a unified, governed platform that migrates infrastructure, integrates IT services, modernizes student systems, and automates DevOps — all while maintaining strict regulatory compliance.
-
-<table>
-<tr>
-<td width="50%">
-
-### 🎯 What ECTP Does
-
-| Capability | Description |
-|:-----------|:------------|
-| ☁️ **Migrates** | On-premises infrastructure to AWS cloud systematically |
-| 🔧 **Integrates** | ServiceNow ITSM with cloud-native operations |
-| 🎓 **Modernizes** | Ellucian Higher Ed systems through API-first architecture |
-| ⚡ **Automates** | DevOps processes across all organizational teams |
-| 📊 **Governs** | Costs, security, and compliance at enterprise scale |
-
-</td>
-<td width="50%">
-
-### 💡 Why This Platform?
-
-Higher Education institutions face unique challenges:
-
-- 🔴 Legacy systems **15-20+ years old** running critical operations
-- 🔴 Regulatory requirements (**FERPA, HIPAA, ADA**) demanding strict governance
-- 🟡 Budget constraints requiring **cost optimization**
-- 🟡 Growing **cybersecurity threats** targeting education
-- 🟢 Need for **rapid innovation** while maintaining stability
-
-</td>
-</tr>
-</table>
-
-### 📊 Key Performance Targets
-
-<div align="center">
-
-| Metric | 🔴 Current State | 🟢 Target State | Improvement |
-|:-------|:----------------:|:---------------:|:-----------:|
-| Infrastructure Cost | $X/month (on-prem) | **30-40% reduction** | ⬇️ Significant |
-| Deployment Frequency | Monthly | **Daily / On-demand** | ⬆️ 30x faster |
-| Mean Time to Recovery | 4-8 hours | **< 30 minutes** | ⬆️ 16x faster |
-| Security Response | 24-48 hours | **< 1 hour** | ⬆️ 48x faster |
-| System Availability | 99.5% | **99.95%** | ⬆️ 4x fewer outages |
-| Manual IT Tasks | 70% manual | **85% automated** | ⬆️ Transformative |
-
-</div>
-
----
-
-<div align="center">
-
-## 2 · Business Objectives
-
-</div>
-
-### 🎯 Primary Objectives
-
-<table>
-<tr>
-<td width="20%" align="center">
-
-**☁️**
-#### Digital Transformation
-Move from legacy on-premises to cloud-native
-
-</td>
-<td width="20%" align="center">
-
-**⚡**
-#### Operational Excellence
-Automate IT operations, reduce manual effort by 85%
-
-</td>
-<td width="20%" align="center">
-
-**💰**
-#### Cost Optimization
-Achieve 30-40% reduction in infrastructure costs
-
-</td>
-<td width="20%" align="center">
-
-**🔒**
-#### Security Hardening
-Zero-trust security with continuous compliance
-
-</td>
-<td width="20%" align="center">
-
-**🎓**
-#### Student Experience
-Improve availability for student-facing apps
-
-</td>
-</tr>
-</table>
-
-### 📐 Strategic Alignment
-
-| Business Goal | ECTP Contribution |
-|:-------------|:------------------|
-| **Enrollment Growth** | Scalable systems handling peak registration loads |
-| **Research Computing** | On-demand HPC resources via cloud |
-| **Student Retention** | Reliable, fast student information systems |
-| **Financial Sustainability** | Optimized IT spending with transparent governance |
-| **Regulatory Compliance** | Automated compliance monitoring and reporting |
-| **Innovation** | Rapid provisioning enabling experimentation |
-
-### ✅ Success Criteria
-
-> - All Tier-1 applications migrated to cloud within Phase 1
-> - Zero FERPA/HIPAA violations during or after migration
-> - ServiceNow integration providing unified ITSM across cloud and on-prem
-> - 95% of infrastructure provisioning automated through IaC
-> - Real-time cost dashboards accessible to all department heads
-
----
-
-<div align="center">
-
-## 3 · Organization-Wide Impact
-
-</div>
-
-### 👥 Stakeholder Impact Matrix
-
-| Stakeholder | Impact | Benefit |
-|:-----------|:------:|:--------|
-| **🏛️ CIO/CTO** | Strategic oversight | Unified technology governance |
-| **⚙️ IT Operations** | Operational model shift | Automation, reduced toil |
-| **🔒 Security Team** | Enhanced tooling | Centralized security posture |
-| **💻 Application Teams** | New deployment model | Self-service, faster releases |
-| **💰 Finance** | Cost visibility | Real-time budget tracking |
-| **📚 Faculty** | Improved systems | Better performance, availability |
-| **🎓 Students** | Better experience | Faster, more reliable services |
-| **📋 Registrar** | System modernization | Integrated Ellucian platform |
-| **🔬 Research** | Computing resources | On-demand HPC, GPU clusters |
-| **📊 Compliance** | Automated reporting | Continuous compliance monitoring |
-
-### 🔄 Organizational Change Management
-
-<table>
-<tr>
-<td width="25%" align="center">
-
-**📖 Training**
-Role-based training for all IT staff
-
-</td>
-<td width="25%" align="center">
-
-**📢 Communication**
-Monthly stakeholder updates, weekly syncs
-
-</td>
-<td width="25%" align="center">
-
-**🛟 Support**
-Tiered support with Cloud CoE
-
-</td>
-<td width="25%" align="center">
-
-**📚 Knowledge**
-Comprehensive docs, runbooks, videos
-
-</td>
-</tr>
-</table>
-
----
-
-<div align="center">
-
-## 4 · Architecture Overview
-
-</div>
-
-### 🧭 Architecture Principles
-
-| Principle | Description |
-|:----------|:------------|
-| ☁️ **Cloud-Native** | Design for cloud from the ground up, not lift-and-shift |
-| 🔒 **Secure by Design** | Security integrated at every layer, not bolted on |
-| ⚡ **Automation-First** | Everything that can be automated, must be automated |
-| 🔌 **API-First** | All integrations through well-defined APIs |
-| 📊 **Governance-Enabled** | Built-in cost, security, and compliance governance |
-| 👁️ **Observable** | Complete visibility into all system components |
-| 🔄 **Resilient** | Design for failure, implement self-healing |
-| 🌐 **Vendor-Neutral** | Avoid vendor lock-in where possible |
-| 🧩 **Modular** | Loosely coupled services, independently deployable |
-| 📈 **Scalable** | Horizontal scaling to handle enrollment surges |
-
-### 🏗️ High-Level Architecture Diagram
-
-```
-┌──────────────────────────────────────────────────────────────────────────────────┐
-│                                EXTERNAL USERS                                     │
-│           Students  │  Faculty  │  Staff  │  Administrators  │  Partners          │
-└────────────────────────────────────┬─────────────────────────────────────────────┘
-                                     │
-                        ┌────────────▼────────────┐
-                        │   🛡️  AWS CloudFront     │
-                        │   CDN + WAF + Shield     │
-                        │   DDoS + Geo-blocking    │
-                        └────────────┬────────────┘
-                                     │
-                        ┌────────────▼────────────┐
-                        │   ⚖️  Application Load   │
-                        │   Balancer (ALB)         │
-                        │   HTTPS + TLS 1.3        │
-                        └────────────┬────────────┘
-                                     │
-                        ┌────────────▼────────────┐
-                        │   🔑  API Gateway        │
-                        │   Rate Limiting │ Auth   │
-                        │   Versioning │ Routing   │
-                        └────────────┬────────────┘
-                                     │
-           ┌─────────────────────────┼─────────────────────────┐
-           │                         │                         │
-  ┌────────▼─────────┐    ┌─────────▼─────────┐    ┌─────────▼─────────┐
-  │ ☁️ CLOUD          │    │ 🔧 SERVICENOW     │    │ 🎓 ELLUCIAN       │
-  │ MIGRATION         │    │ INTEGRATION       │    │ INTEGRATION       │
-  │                   │    │                   │    │                   │
-  │ • Discovery       │    │ • Incident Mgmt   │    │ • Banner API      │
-  │ • Assessment      │    │ • Change Mgmt     │    │ • Ethos Platform  │
-  │ • Migration       │    │ • CMDB Sync       │    │ • Student Data    │
-  │ • Validation      │    │ • Automation       │    │ • Enrollment      │
-  │ • Optimization    │    │ • SLA Tracking    │    │ • Financial Aid   │
-  └────────┬─────────┘    └─────────┬─────────┘    └─────────┬─────────┘
-           │                         │                         │
-  ┌────────▼─────────────────────────▼─────────────────────────▼─────────┐
-  │                       ⚙️ CORE SERVICES LAYER                          │
-  │                                                                       │
-  │  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐         │
-  │  │  Config   │  │ Logging   │  │  Auth &   │  │  Event    │         │
-  │  │  Manager  │  │ Service   │  │ Identity  │  │   Bus     │         │
-  │  └───────────┘  └───────────┘  └───────────┘  └───────────┘         │
-  │  ┌───────────┐  ┌───────────┐  ┌───────────┐  ┌───────────┐         │
-  │  │   Cost    │  │ Monitor   │  │  Audit    │  │ Workflow  │         │
-  │  │ Governance│  │ Service   │  │  Logger   │  │  Engine   │         │
-  │  └───────────┘  └───────────┘  └───────────┘  └───────────┘         │
-  └────────┬─────────────────────────┬─────────────────────────┬─────────┘
-           │                         │                         │
-  ┌────────▼─────────┐    ┌─────────▼─────────┐    ┌─────────▼─────────┐
-  │ 💾 DATA LAYER    │    │ 📨 MESSAGING      │    │ 📦 STORAGE        │
-  │                   │    │                   │    │                   │
-  │ • RDS (PgSQL)     │    │ • SQS Queues      │    │ • S3 Buckets      │
-  │ • DynamoDB        │    │ • SNS Topics      │    │ • EFS / EBS       │
-  │ • ElastiCache     │    │ • EventBridge     │    │ • Glacier          │
-  │ • DocumentDB      │    │ • Step Functions  │    │ • Backup Vault    │
-  └───────────────────┘    └───────────────────┘    └───────────────────┘
-           │                         │                         │
-  ┌────────▼─────────────────────────▼─────────────────────────▼─────────┐
-  │                    🏗️ INFRASTRUCTURE LAYER (AWS)                      │
-  │                                                                       │
-  │  VPC │ Subnets │ Security Groups │ NACLs │ Transit Gateway            │
-  │  ECS/EKS │ EC2 │ Lambda │ Direct Connect │ Route53                    │
-  │  IAM │ KMS │ Secrets Manager │ CloudTrail │ GuardDuty                 │
-  │  CloudWatch │ X-Ray │ Config │ Systems Manager                        │
-  └───────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-<div align="center">
-
-## 5 · Logical Architecture
-
-</div>
-
-### 🧩 Service Decomposition
-
-```
-  ┌─────────────────────────────────────────────────────────────┐
-  │                    🖥️ PRESENTATION LAYER                     │
-  │      Admin Portal  │  API Documentation  │  Dashboards       │
-  └────────────────────────────┬────────────────────────────────┘
-                               │
-  ┌────────────────────────────▼────────────────────────────────┐
-  │                      🔌 API LAYER                            │
-  │    REST APIs │ GraphQL │ WebSocket │ gRPC                    │
-  │    Authentication │ Rate Limiting │ Versioning               │
-  └────────────────────────────┬────────────────────────────────┘
-                               │
-  ┌────────────────────────────▼────────────────────────────────┐
-  │                 ⚙️ BUSINESS LOGIC LAYER                      │
-  │                                                              │
-  │   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-  │   │  Migration   │  │ Integration  │  │  Governance  │     │
-  │   │ Orchestrator │  │     Hub      │  │    Engine    │     │
-  │   └──────────────┘  └──────────────┘  └──────────────┘     │
-  │   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐     │
-  │   │  Automation  │  │    Cost      │  │  Compliance  │     │
-  │   │    Engine    │  │  Optimizer   │  │   Manager    │     │
-  │   └──────────────┘  └──────────────┘  └──────────────┘     │
-  └────────────────────────────┬────────────────────────────────┘
-                               │
-  ┌────────────────────────────▼────────────────────────────────┐
-  │                 💾 DATA ACCESS LAYER                          │
-  │    ORM │ Connection Pooling │ Caching │ Event Sourcing       │
-  └────────────────────────────┬────────────────────────────────┘
-                               │
-  ┌────────────────────────────▼────────────────────────────────┐
-  │                 🏗️ INFRASTRUCTURE LAYER                      │
-  │    Compute │ Storage │ Network │ Security │ Monitoring       │
-  └─────────────────────────────────────────────────────────────┘
-```
-
-### 📦 Domain Model
-
-```
-  ┌─────────────────────────────────────────────────────────────────┐
-  │                      ECTP DOMAIN MODEL                           │
-  │                                                                  │
-  │   ┌──────────────┐     ┌──────────────┐     ┌──────────────┐   │
-  │   │  Workload    │────▶│  Migration   │────▶│    Cloud     │   │
-  │   │  Discovery   │     │    Plan      │     │   Resource   │   │
-  │   └──────┬───────┘     └──────┬───────┘     └──────┬───────┘   │
-  │          │                    │                     │            │
-  │          ▼                    ▼                     ▼            │
-  │   ┌──────────────┐     ┌──────────────┐     ┌──────────────┐   │
-  │   │  Assessment  │     │   Service    │     │    Cost      │   │
-  │   │   Report     │     │   Ticket     │     │   Record     │   │
-  │   └──────┬───────┘     └──────┬───────┘     └──────┬───────┘   │
-  │          │                    │                     │            │
-  │          ▼                    ▼                     ▼            │
-  │   ┌──────────────┐     ┌──────────────┐     ┌──────────────┐   │
-  │   │  Compliance  │     │    Audit     │     │    Alert     │   │
-  │   │   Check      │     │     Log      │     │    Rule      │   │
-  │   └──────────────┘     └──────────────┘     └──────────────┘   │
-  └─────────────────────────────────────────────────────────────────┘
-```
-
----
-
-<div align="center">
-
-## 6 · Physical Architecture
-
-</div>
-
-### 🏢 AWS Multi-Account Strategy
-
-```
-  ┌───────────────────────────────────────────────────────────────────┐
-  │                      AWS ORGANIZATION                              │
-  │                                                                    │
-  │   ┌───────────────────────────────────────────────────────────┐   │
-  │   │  🏛️ Management Account                                    │   │
-  │   │  AWS Organizations │ Billing │ SSO │ CloudTrail            │   │
-  │   └────────────────────────────┬──────────────────────────────┘   │
-  │                                │                                   │
-  │          ┌─────────────────────┼─────────────────────┐            │
-  │          │                     │                     │            │
-  │   ┌──────▼──────┐      ┌──────▼──────┐      ┌──────▼──────┐     │
-  │   │ 🔒 Security │      │ 🔗 Shared   │      │ 📋 Log      │     │
-  │   │   Account   │      │  Services   │      │  Archive    │     │
-  │   │             │      │   Account   │      │  Account    │     │
-  │   │ GuardDuty   │      │ Transit GW  │      │ CloudTrail  │     │
-  │   │ Security Hub│      │ DNS / CIDR  │      │ VPC Flow    │     │
-  │   │ Inspector   │      │ CI/CD       │      │ App Logs    │     │
-  │   └─────────────┘      └─────────────┘      └─────────────┘     │
-  │                                │                                   │
-  │          ┌─────────────────────┼─────────────────────┐            │
-  │          │                     │                     │            │
-  │   ┌──────▼──────┐      ┌──────▼──────┐      ┌──────▼──────┐     │
-  │   │ 🧪 Dev      │      │ 🧪 QA/UAT  │      │ 🚀 Prod     │     │
-  │   │   Account   │      │   Account   │      │   Account   │     │
-  │   │             │      │             │      │             │     │
-  │   │ Dev VPC     │      │ QA VPC      │      │ Prod VPC    │     │
-  │   │ Dev ECS     │      │ UAT VPC     │      │ Prod ECS    │     │
-  │   │ Dev RDS     │      │ Test RDS    │      │ Prod RDS    │     │
-  │   └─────────────┘      └─────────────┘      └─────────────┘     │
-  └───────────────────────────────────────────────────────────────────┘
-```
-
-### 🌐 Network Architecture
-
-```
-  ┌───────────────────────────────────────────────────────────────────┐
-  │                       VPC: 10.0.0.0/16                             │
-  │                                                                    │
-  │   ┌───────────────────────────────────────────────────────────┐   │
-  │   │ 🌐 PUBLIC SUBNETS (10.0.1.0/24, 10.0.2.0/24)             │   │
-  │   │ ALB │ NAT Gateway │ Bastion (if needed)                    │   │
-  │   └──────────────────────────┬────────────────────────────────┘   │
-  │                              │                                     │
-  │   ┌──────────────────────────▼────────────────────────────────┐   │
-  │   │ 🔵 PRIVATE APP SUBNETS (10.0.10.0/24, 10.0.11.0/24)      │   │
-  │   │ ECS Tasks │ Lambda │ Application Servers                    │   │
-  │   └──────────────────────────┬────────────────────────────────┘   │
-  │                              │                                     │
-  │   ┌──────────────────────────▼────────────────────────────────┐   │
-  │   │ 🟠 PRIVATE DATA SUBNETS (10.0.20.0/24, 10.0.21.0/24)     │   │
-  │   │ RDS │ ElastiCache │ DocumentDB                              │   │
-  │   └───────────────────────────────────────────────────────────┘   │
-  │                                                                    │
-  │   ┌───────────────────────────────────────────────────────────┐   │
-  │   │ 🔴 ISOLATED SUBNETS (10.0.30.0/24, 10.0.31.0/24)         │   │
-  │   │ VPC Endpoints │ Internal Services (no internet access)      │   │
-  │   └───────────────────────────────────────────────────────────┘   │
-  └────────────┬──────────────────────────────────────────────────────┘
-               │
-               │ Transit Gateway / VPC Peering / VPN
-               │
-  ┌────────────▼──────────────────────────────────────────────────────┐
-  │                    ON-PREMISES DATA CENTER                         │
-  │  Ellucian Banner/Colleague │ ServiceNow │ Active Directory        │
-  └───────────────────────────────────────────────────────────────────┘
-```
-
----
-
-<div align="center">
-
-## 7 · Integration Points
-
-</div>
-
-### 🔗 Integration Architecture
-
-```
-                                   ┌────────────────┐
-                ┌─────────────────▶│   AWS Services  │
-                │   REST / SDK     │   (Native)      │
-                │                  └────────────────┘
-                │
-  ┌─────────────┤                  ┌────────────────┐
-  │    ECTP     ├─────────────────▶│   ServiceNow   │
-  │    Core     │  REST + OAuth2   │   ITSM         │
-  │   Platform  │                  └────────────────┘
-  │             │
-  │             ├─────────────────▶┌────────────────┐
-  │             │  REST / Ethos    │   Ellucian     │
-  │             │                  │   Banner       │
-  │             │                  └────────────────┘
-  │             │
-  │             ├─────────────────▶┌────────────────┐
-  │             │  SAML / OIDC     │   Identity     │
-  │             │                  │   Provider     │
-  │             │                  └────────────────┘
-  │             │
-  └─────────────┤                  ┌────────────────┐
-                └─────────────────▶│  Notification  │
-                   SMTP / Webhook  │   Systems      │
-                                   └────────────────┘
-```
-
-### 📋 Integration Matrix
-
-| Source | Target | Protocol | Auth | Data Flow | Frequency |
-|:-------|:-------|:---------|:-----|:----------|:----------|
-| ECTP | **AWS Services** | AWS SDK / REST | IAM Roles | Bidirectional | Real-time |
-| ECTP | **ServiceNow** | REST API | OAuth 2.0 | Bidirectional | Real-time |
-| ECTP | **Ellucian Banner** | Ethos API | API Key + OAuth | Read/Write | Near real-time |
-| ECTP | **Active Directory** | LDAP / SAML | Service Account | Read | On-demand |
-| ECTP | **Notifications** | SMTP / Webhook | API Key | Outbound | Event-driven |
-| AWS | **ECTP** | EventBridge | IAM | Inbound | Event-driven |
-| ServiceNow | **ECTP** | Webhook | HMAC | Inbound | Event-driven |
-
-### ☁️ AWS Service Integration
-
-<details>
-<summary><b>Click to expand full AWS service catalog</b></summary>
-
-| AWS Service | Purpose | Integration Pattern |
-|:------------|:--------|:-------------------|
-| **EC2/ECS** | Compute | Direct SDK, Terraform provisioned |
-| **RDS** | Database | Connection pooling, IAM auth |
-| **S3** | Object Storage | Pre-signed URLs, server-side encryption |
-| **SQS/SNS** | Messaging | Event-driven async processing |
-| **Lambda** | Serverless | Event triggers, scheduled jobs |
-| **CloudWatch** | Monitoring | Metrics, logs, alarms |
-| **IAM** | Identity | Role-based access, service accounts |
-| **KMS** | Encryption | Key management, envelope encryption |
-| **Secrets Manager** | Secrets | Credential rotation, secure access |
-| **Systems Manager** | Operations | Parameter store, patch management |
-| **Step Functions** | Orchestration | Complex workflow coordination |
-| **EventBridge** | Events | Cross-service event routing |
-
-</details>
-
----
-
-<div align="center">
-
-## 8 · Security Model
-
-</div>
-
-### 🔒 Defense in Depth — Security Layers
-
-```
-  ┌─────────────────────────────────────────────────────────────────┐
-  │                                                                  │
-  │  ╔═══════════════════════════════════════════════════════════╗   │
-  │  ║  🔴 LAYER 1: PERIMETER DEFENSE                           ║   │
-  │  ║  AWS WAF │ Shield Advanced │ CloudFront │ Geo-blocking    ║   │
-  │  ╚═══════════════════════════════════════════════════════════╝   │
-  │                                                                  │
-  │  ╔═══════════════════════════════════════════════════════════╗   │
-  │  ║  🟠 LAYER 2: NETWORK SECURITY                            ║   │
-  │  ║  VPC Isolation │ Security Groups │ NACLs │ VPC Endpoints  ║   │
-  │  ╚═══════════════════════════════════════════════════════════╝   │
-  │                                                                  │
-  │  ╔═══════════════════════════════════════════════════════════╗   │
-  │  ║  🟡 LAYER 3: IDENTITY & ACCESS                           ║   │
-  │  ║  AWS IAM │ Cognito │ SAML │ RBAC │ MFA │ SSO             ║   │
-  │  ╚═══════════════════════════════════════════════════════════╝   │
-  │                                                                  │
-  │  ╔═══════════════════════════════════════════════════════════╗   │
-  │  ║  🔵 LAYER 4: APPLICATION SECURITY                        ║   │
-  │  ║  Input Validation │ Output Encoding │ CSRF │ JWT │ Rate   ║   │
-  │  ╚═══════════════════════════════════════════════════════════╝   │
-  │                                                                  │
-  │  ╔═══════════════════════════════════════════════════════════╗   │
-  │  ║  🟢 LAYER 5: DATA PROTECTION                             ║   │
-  │  ║  AES-256 at Rest │ TLS 1.3 in Transit │ KMS │ DLP        ║   │
-  │  ╚═══════════════════════════════════════════════════════════╝   │
-  │                                                                  │
-  │  ╔═══════════════════════════════════════════════════════════╗   │
-  │  ║  🟣 LAYER 6: MONITORING & RESPONSE                       ║   │
-  │  ║  GuardDuty │ Security Hub │ CloudTrail │ Inspector        ║   │
-  │  ╚═══════════════════════════════════════════════════════════╝   │
-  │                                                                  │
-  └─────────────────────────────────────────────────────────────────┘
-```
-
-### 👤 IAM & RBAC Model
-
-| Role | Permissions | Scope |
-|:-----|:-----------|:------|
-| 🔴 **Platform Admin** | Full platform access | All environments |
-| 🟠 **Cloud Engineer** | Infrastructure management | Dev, QA, UAT |
-| 🟡 **Developer** | Application deployment | Dev environment |
-| 🔵 **Security Analyst** | Security monitoring, read-only | All environments |
-| 🟢 **Cost Analyst** | Cost reports, budget management | All environments |
-| 🔧 **ServiceNow Admin** | Integration configuration | Integration layer |
-| 🎓 **Ellucian Admin** | Higher Ed integration | Integration layer |
-| 📋 **Auditor** | Read-only, audit logs | All environments |
-| 🏛️ **Department Head** | Cost reports for department | Department scope |
-
-### 🔐 Encryption Strategy
-
-| Data State | Method | Key Management |
-|:-----------|:-------|:---------------|
-| At Rest (S3) | SSE-KMS (AES-256) | AWS KMS with CMK |
-| At Rest (RDS) | TDE with KMS | AWS KMS with CMK |
-| At Rest (EBS) | EBS Encryption | AWS KMS with CMK |
-| In Transit | TLS 1.3 | ACM Certificates |
-| In Transit (VPN) | IPSec / IKEv2 | Pre-shared keys + certs |
-| Secrets | Secrets Manager | Automatic rotation |
-| PII Fields | Field-level encryption | Application-managed KMS |
-
----
-
-<div align="center">
-
-## 9 · Compliance Considerations
-
-</div>
-
-### 📜 Regulatory Landscape
-
-| Regulation | Applicability | Key Requirements |
-|:-----------|:-------------|:-----------------|
-| 🎓 **FERPA** | Student educational records | Access controls, audit logging, data minimization |
-| 🏥 **HIPAA** | Student health data | Encryption, BAAs, access controls, breach notification |
-| 🔒 **SOC 2** | Service organization controls | Security, availability, processing integrity |
-| 💳 **PCI DSS** | Payment card data | Network segmentation, encryption, access control |
-| 💰 **GLBA** | Financial information | Data protection, access controls |
-| ♿ **ADA/508** | Accessibility | Web content accessibility |
-| 📋 **State Privacy** | Personal information | Varies by state |
-
-### 🗺️ FERPA Controls Mapping
-
-```
-  FERPA Requirements            →    ECTP Controls
-  ═══════════════════           ═══════════════════
-  Access Control                →    IAM + RBAC + MFA
-  Audit Trail                   →    CloudTrail + Application Logging
-  Data Minimization             →    Data classification + retention policies
-  Breach Notification           →    GuardDuty + SNS alerts + runbooks
-  Consent Management            →    Application-level consent tracking
-  Directory Information         →    Configurable data exposure rules
-```
-
-### 🔄 Continuous Compliance
-
-> **No more annual-only audits.** ECTP implements continuous compliance monitoring:
-
-- **AWS Config Rules** — Automated compliance checks on infrastructure
-- **Security Hub** — Centralized compliance scoring and findings
-- **Custom Lambda** — Organization-specific compliance validators
-- **Audit Reports** — Automated monthly compliance reports
-- **Evidence Collection** — Automated artifact gathering for audits
-
----
-
-<div align="center">
-
-## 10 · Scalability Model
-
-</div>
-
-### 📈 Scaling Strategy
-
-```
-  ┌─────────────────────────────────────────────────────────────────┐
-  │                    SCALING DIMENSIONS                             │
-  │                                                                  │
-  │  HORIZONTAL SCALING            VERTICAL SCALING                  │
-  │  ┌──────────────────┐         ┌──────────────────┐              │
-  │  │ ECS Auto-scaling  │         │ RDS Instance     │              │
-  │  │ (2 → 12 tasks)   │         │ Upgrade          │              │
-  │  └──────────────────┘         └──────────────────┘              │
-  │  ┌──────────────────┐         ┌──────────────────┐              │
-  │  │ ALB Target Group  │         │ ElastiCache      │              │
-  │  │ Scaling           │         │ Node Size        │              │
-  │  └──────────────────┘         └──────────────────┘              │
-  │                                                                  │
-  │  EVENT-DRIVEN SCALING          SCHEDULED SCALING                 │
-  │  ┌──────────────────┐         ┌──────────────────┐              │
-  │  │ Lambda Auto       │         │ Predictive       │              │
-  │  │ (Concurrency)     │         │ (Enrollment      │              │
-  │  └──────────────────┘         │  periods)        │              │
-  │  ┌──────────────────┐         └──────────────────┘              │
-  │  │ SQS-based         │                                          │
-  │  │ (Queue depth)     │                                          │
-  │  └──────────────────┘                                           │
-  └─────────────────────────────────────────────────────────────────┘
-```
-
-### 📊 Capacity Planning
-
-| Component | Baseline | Peak (Enrollment) | Scale Factor |
-|:----------|:---------|:-----------------|:------------:|
-| API Servers | 3 tasks | 12 tasks | **4x** |
-| Database | db.r6g.large | db.r6g.2xlarge | **2x** (vertical) |
-| Cache | cache.r6g.large | cache.r6g.large × 4 nodes | **2x** |
-| Queue Workers | 2 tasks | 8 tasks | **4x** |
-| Lambda | 100 concurrent | 1000 concurrent | **10x** |
-
-### 🏢 Multi-Tenant Architecture
-
-> The platform supports **multi-institution deployment**:
-
-- **Shared Infrastructure:** Common VPC, ALB, monitoring
-- **Isolated Data:** Separate databases per institution
-- **Configurable:** Per-tenant feature flags and limits
-- **Fair Scheduling:** Resource quotas per tenant
-
----
-
-<div align="center">
-
-## 11 · Monitoring & Observability
-
-</div>
-
-### 👁️ Three Pillars of Observability
-
-```
-  ┌─────────────────────────────────────────────────────────────────┐
-  │                   OBSERVABILITY STACK                             │
-  │                                                                  │
-  │  ┌───────────────┐   ┌───────────────┐   ┌───────────────┐     │
-  │  │  📊 METRICS   │   │  📋 LOGS      │   │  🔍 TRACES    │     │
-  │  │               │   │               │   │               │     │
-  │  │  CloudWatch   │   │  CloudWatch   │   │  AWS X-Ray    │     │
-  │  │  Metrics      │   │  Logs         │   │               │     │
-  │  │               │   │               │   │  Distributed  │     │
-  │  │  Custom       │   │  Structured   │   │  Tracing      │     │
-  │  │  Metrics      │   │  JSON Logs    │   │               │     │
-  │  │               │   │               │   │  Service Map  │     │
-  │  │  Prometheus   │   │  Log          │   │               │     │
-  │  │  (optional)   │   │  Aggregation  │   │  Latency      │     │
-  │  └───────┬───────┘   └───────┬───────┘   └───────┬───────┘     │
-  │          │                    │                    │              │
-  │          └────────────────────┼────────────────────┘              │
-  │                               │                                   │
-  │                   ┌───────────▼───────────┐                      │
-  │                   │    📊 DASHBOARDS      │                      │
-  │                   │  CloudWatch / Grafana  │                      │
-  │                   └───────────┬───────────┘                      │
-  │                               │                                   │
-  │                   ┌───────────▼───────────┐                      │
-  │                   │    🔔 ALERTING        │                      │
-  │                   │  SNS │ PagerDuty      │                      │
-  │                   │  Slack │ Email         │                      │
-  │                   └───────────────────────┘                      │
-  └─────────────────────────────────────────────────────────────────┘
-```
-
-### 📏 Key Metrics & SLAs
-
-| Metric | SLO Target | 🚨 Alert Threshold | Response |
-|:-------|:----------|:-------------------|:---------|
-| API Availability | 99.95% | < 99.9% | 🔴 P1 — Immediate |
-| API Latency (p99) | < 500ms | > 1s | 🟠 P2 — 30 min |
-| Error Rate | < 0.1% | > 0.5% | 🔴 P1 — Immediate |
-| Database CPU | < 70% | > 80% | 🟠 P2 — 30 min |
-| Queue Depth | < 1000 | > 5000 | 🟠 P2 — 30 min |
-| Failed Deployments | 0 | Any failure | 🟠 P2 — 30 min |
-| Security Findings | 0 Critical | Any critical | 🔴 P1 — Immediate |
-| Cost Anomaly | < 10% variance | > 20% variance | 🟡 P3 — 4 hours |
-
----
-
-<div align="center">
-
-## 12 · Cost Governance
-
-</div>
-
-### 💰 Cost Management Framework
-
-```
-  ┌─────────────────────────────────────────────────────────────────┐
-  │                  COST GOVERNANCE FRAMEWORK                       │
-  │                                                                  │
-  │  ┌──────────────────────────────────────────────────────────┐   │
-  │  │  👁️ VISIBILITY                                           │   │
-  │  │  • AWS Cost Explorer │ Custom Dashboards                  │   │
-  │  │  • Per-department cost allocation                         │   │
-  │  │  • Showback / Chargeback reports                          │   │
-  │  └──────────────────────────────────────────────────────────┘   │
-  │                                                                  │
-  │  ┌──────────────────────────────────────────────────────────┐   │
-  │  │  📉 OPTIMIZATION                                         │   │
-  │  │  • Reserved Instances / Savings Plans                     │   │
-  │  │  • Right-sizing recommendations                           │   │
-  │  │  • Spot Instances for non-critical workloads              │   │
-  │  │  • S3 Lifecycle policies                                  │   │
-  │  │  • Unused resource cleanup automation                     │   │
-  │  └──────────────────────────────────────────────────────────┘   │
-  │                                                                  │
-  │  ┌──────────────────────────────────────────────────────────┐   │
-  │  │  📋 GOVERNANCE                                           │   │
-  │  │  • Tagging enforcement (mandatory tags)                   │   │
-  │  │  • Budget alerts (50%, 80%, 100% thresholds)              │   │
-  │  │  • Service Control Policies (SCPs)                        │   │
-  │  │  • Approved service catalog                               │   │
-  │  │  • Monthly cost review meetings                           │   │
-  │  └──────────────────────────────────────────────────────────┘   │
-  └─────────────────────────────────────────────────────────────────┘
-```
-
-### 🏷️ Mandatory Tagging Policy
-
-| Tag Key | Required | Example | Purpose |
-|:--------|:--------:|:--------|:--------|
-| `Environment` | ✅ | dev, qa, uat, prod | Environment identification |
-| `Project` | ✅ | ECTP | Project tracking |
-| `Owner` | ✅ | team-cloud-ops | Ownership |
-| `Department` | ✅ | IT, Finance, Registrar | Cost allocation |
-| `CostCenter` | ✅ | CC-12345 | Financial tracking |
-| `DataClassification` | ✅ | public, internal, confidential | Security |
-| `ManagedBy` | ✅ | terraform, manual | IaC tracking |
-| `Application` | ✅ | migration-svc, api-gateway | Application ID |
-
----
-
-<div align="center">
-
-## 13 · Risk Assessment
-
-</div>
-
-### ⚠️ Risk Matrix
-
-| ID | Risk | Likelihood | Impact | Severity | Mitigation |
-|:--:|:-----|:----------:|:------:|:--------:|:-----------|
-| R-001 | Data breach during migration | 🟡 Medium | 🔴 Critical | **HIGH** | Encrypted transfers, access controls, monitoring |
-| R-002 | FERPA compliance violation | 🟢 Low | 🔴 Critical | **HIGH** | Automated compliance checks, training, audit logs |
-| R-003 | ServiceNow integration failure | 🟡 Medium | 🟠 High | **HIGH** | Circuit breakers, fallback queues, monitoring |
-| R-004 | Ellucian API breaking changes | 🟡 Medium | 🟠 High | **HIGH** | API versioning, contract testing, abstraction layer |
-| R-005 | Cost overrun | 🟡 Medium | 🟡 Medium | **MEDIUM** | Budget alerts, auto-scaling limits, reserved capacity |
-| R-006 | Key personnel dependency | 🔴 High | 🟡 Medium | **HIGH** | Cross-training, documentation, runbooks |
-| R-007 | AWS service outage | 🟢 Low | 🟠 High | **MEDIUM** | Multi-AZ, disaster recovery, runbooks |
-| R-008 | Vendor lock-in | 🟡 Medium | 🟡 Medium | **MEDIUM** | Abstraction layers, containerization, standard APIs |
-| R-009 | Scope creep | 🔴 High | 🟡 Medium | **HIGH** | Change management, governance board |
-| R-010 | Performance degradation | 🟡 Medium | 🟠 High | **HIGH** | Load testing, auto-scaling, performance monitoring |
-
-### 🛡️ Mitigation Strategies
-
-<table>
-<tr>
-<td width="25%" valign="top">
-
-**🔧 Technical**
-- Circuit breakers & retries
-- Fallback mechanisms
-- Multi-AZ deployment
-- Auto-scaling
-
-</td>
-<td width="25%" valign="top">
-
-**📋 Process**
-- Change management board
-- Risk review meetings
-- Operational runbooks
-- Post-mortems
-
-</td>
-<td width="25%" valign="top">
-
-**👥 People**
-- Cross-training programs
-- Comprehensive documentation
-- Knowledge transfer sessions
-- Cloud CoE mentoring
-
-</td>
-<td width="25%" valign="top">
-
-**🏛️ Governance**
-- Budget controls
-- Scope management
-- Stakeholder reviews
-- ADR process
-
-</td>
-</tr>
-</table>
-
----
-
-<div align="center">
-
-## 14 · Data Architecture
-
-</div>
-
-### 📊 Data Flow Diagram
-
-```
-  ┌──────────────┐      ┌──────────────┐      ┌──────────────┐
-  │  🎓 Ellucian │─────▶│   ETL /      │─────▶│  💾 ECTP     │
-  │   Banner     │      │   Sync       │      │   Database   │
-  └──────────────┘      │   Service    │      │   (RDS)      │
-                        └──────────────┘      └──────┬───────┘
-  ┌──────────────┐            │                      │
-  │ 🔧 ServiceNow│────────────┘                      │
-  │   CMDB       │                            ┌──────▼───────┐
-  └──────────────┘                            │ 📊 Analytics │
-                                              │  (Redshift / │
-  ┌──────────────┐                            │   Athena)    │
-  │ ☁️ AWS       │───────────────────────────▶└──────────────┘
-  │  Resource    │
-  │  Metadata    │
-  └──────────────┘
-```
-
-### 📁 Data Classification
-
-| Classification | Description | Storage | Encryption | Access |
-|:--------------|:------------|:--------|:-----------|:-------|
-| 🟢 **Public** | Marketing, general info | S3 | SSE-S3 | Open |
-| 🔵 **Internal** | Operational data | RDS / S3 | SSE-KMS | Authenticated |
-| 🟠 **Confidential** | Student PII, financial | RDS | SSE-KMS + field | RBAC + MFA |
-| 🔴 **Restricted** | SSN, health records | RDS (isolated) | SSE-KMS + field | MFA + audit |
-
----
-
-<div align="center">
-
-## 15 · Disaster Recovery
-
-</div>
-
-### 🔄 DR Strategy by Tier
-
-| Tier | RTO | RPO | Strategy | Components |
-|:----:|:---:|:---:|:---------|:-----------|
-| **Tier 1** | 15 min | 0 | Multi-AZ Active-Active | API, Database, Cache |
-| **Tier 2** | 1 hour | 15 min | Warm Standby | Integration services |
-| **Tier 3** | 4 hours | 1 hour | Pilot Light | Reporting, analytics |
-| **Tier 4** | 24 hours | 24 hours | Backup & Restore | Archives, non-critical |
-
-### 💾 Backup Strategy
-
-| Resource | Method | Retention | Cross-Region |
-|:---------|:-------|:----------|:------------:|
-| **RDS** | Automated daily snapshots | 35 days | ✅ us-west-2 |
-| **S3** | Versioning + replication | Lifecycle-managed | ✅ us-west-2 |
-| **DynamoDB** | Point-in-time recovery | 35 days | ✅ |
-| **EBS** | AWS Backup snapshots | 30 days | ✅ |
-| **Configuration** | Git + Secrets Manager | Unlimited | ✅ |
-
----
-
-<div align="center">
-
-## 16 · Future Roadmap
-
-</div>
-
-### 🗺️ Phased Delivery Plan
-
-```
-  Phase 1                Phase 2                Phase 3                Phase 4
-  FOUNDATION             INTEGRATION            AUTOMATION             OPTIMIZATION
-  (Months 1-3)           (Months 4-6)           (Months 7-9)          (Months 10-12)
-  ┌──────────┐           ┌──────────┐           ┌──────────┐          ┌──────────┐
-  │ ▪ Infra  │           │ ▪ SNOW   │           │ ▪ Auto   │          │ ▪ AI/ML  │
-  │ ▪ IAM    │──────────▶│ ▪ Ethos  │──────────▶│ ▪ Portal │─────────▶│ ▪ Predict│
-  │ ▪ CI/CD  │           │ ▪ Migrate│           │ ▪ Prod   │          │ ▪ Multi  │
-  │ ▪ Dev/QA │           │ ▪ Cost   │           │ ▪ Monitor│          │ ▪ Comply │
-  └──────────┘           └──────────┘           └──────────┘          └──────────┘
-```
-
-### 🚀 Phase 5: Innovation (Year 2+)
-
-| Innovation | Description | Business Value |
-|:-----------|:------------|:---------------|
-| 🤖 **AI Chatbot** | IT support chatbot powered by LLM | 50% ticket deflection |
-| 🔮 **Predictive Maintenance** | ML-based failure prediction | 80% fewer incidents |
-| ⛓️ **Blockchain Credentials** | Verifiable academic credentials | Fraud prevention |
-| 📡 **IoT Campus** | Smart building integration | Energy savings |
-| 🖥️ **HPC Platform** | Research computing on-demand | Faculty research support |
-| 📊 **Data Lake** | Institutional analytics | Data-driven decisions |
-
----
-
-<div align="center">
-
-## Appendix
-
-</div>
-
-<details>
-<summary><b>📖 A. Glossary</b></summary>
-
-| Term | Definition |
-|:-----|:----------|
-| ECTP | Enterprise Cloud Transformation Platform |
-| FERPA | Family Educational Rights and Privacy Act |
-| ITSM | IT Service Management |
-| IaC | Infrastructure as Code |
-| RBAC | Role-Based Access Control |
-| SLO | Service Level Objective |
-| RTO | Recovery Time Objective |
-| RPO | Recovery Point Objective |
-| CMK | Customer Managed Key |
-| CMDB | Configuration Management Database |
-
-</details>
-
-<details>
-<summary><b>📚 B. References</b></summary>
-
-- AWS Well-Architected Framework
-- NIST Cybersecurity Framework
-- EDUCAUSE IT Strategy Guide
-- Ellucian Ethos API Documentation
-- ServiceNow Integration Best Practices
-
-</details>
-
----
-
-<div align="center">
-
----
-
-**Document Author:** Gopi Krishna Vajrala
-
-**Enterprise Cloud Transformation Platform (ECTP)** — Architecture Document v1.0.0
-
-**Review Status:** ✅ Approved | **Next Review:** 2026-08-16
-
-</div>
+|---------|------|--------|---------|
+| 1.0.0 | 2026-02-21 | Gopi Krishna Vajrala | Initial architecture document |

@@ -1,37 +1,30 @@
-"""
-============================================================================
-ECTP Custom Exceptions Module
-Author: Gopi Krishna Vajrala
-============================================================================
-Re-exports all custom exceptions for convenient imports:
-    from src.core.exceptions import NotFoundError, AuthenticationError
-============================================================================
+"""Netflix LLM Platform - Custom Exceptions Module.
+
+Re-exports all custom exceptions for convenient imports::
+
+    from src.core.exceptions import InferenceError, GPUMemoryError
 """
 
 from src.core.exceptions.handlers import (
-    ECTPBaseError,
-    NotFoundError,
-    AuthenticationError,
-    AuthorizationError,
-    ValidationError,
-    ExternalServiceError,
-    ServiceNowError,
-    EllucianError,
-    AWSServiceError,
-    RateLimitError,
-    ConfigurationError,
+    PlatformBaseError,
+    InferenceError,
+    GPUMemoryError,
+    KVCacheOverflowError,
+    ModelNotFoundError,
+    RegionFailoverError,
+    RateLimitExceededError,
+    CircuitBreakerOpenError,
+    register_exception_handlers,
 )
 
 __all__ = [
-    "ECTPBaseError",
-    "NotFoundError",
-    "AuthenticationError",
-    "AuthorizationError",
-    "ValidationError",
-    "ExternalServiceError",
-    "ServiceNowError",
-    "EllucianError",
-    "AWSServiceError",
-    "RateLimitError",
-    "ConfigurationError",
+    "PlatformBaseError",
+    "InferenceError",
+    "GPUMemoryError",
+    "KVCacheOverflowError",
+    "ModelNotFoundError",
+    "RegionFailoverError",
+    "RateLimitExceededError",
+    "CircuitBreakerOpenError",
+    "register_exception_handlers",
 ]

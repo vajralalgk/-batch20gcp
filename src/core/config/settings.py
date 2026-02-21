@@ -1,420 +1,336 @@
-"""
-============================================================================
-Enterprise Cloud Transformation Platform (ECTP)
-Centralized Configuration Management
-Author: Gopi Krishna Vajrala
-============================================================================
+"""Netflix LLM Platform - Centralized Configuration.
 
-WHY THIS MODULE EXISTS:
-    Enterprise applications need a single source of truth for configuration.
-    This module loads settings from environment variables (12-factor app principle)
-    with validation, type safety, and sensible defaults.
+Uses pydantic-settings for type-safe configuration with automatic
+environment variable loading. Every setting can be overridden via
+environment variables using the prefix hierarchy (e.g., ``APP_NAME``,
+``GPU_ENABLE_GPU``, ``REDIS_URL``).
 
-DESIGN DECISIONS:
-    - Uses Pydantic BaseSettings for automatic env var loading + validation
-    - All secrets come from environment variables, NEVER hardcoded
-    - Grouped into logical sections for maintainability
-    - Singleton pattern ensures consistent configuration across the app
+Usage::
 
-SECURITY IMPLICATIONS:
-    - Database passwords and API keys are loaded from env vars only
-    - No secrets are logged or exposed in error messages
-    - Settings object redacts sensitive fields in string representation
+    from src.core.config import settings
 
-ALTERNATIVES CONSIDERED:
-    - YAML config files: Rejected because env vars are cloud-native standard
-    - AWS Parameter Store: Used in production but env vars for local dev
-    - Dataclasses: Rejected because Pydantic gives validation for free
-============================================================================
+    print(settings.app.name)
+    print(settings.gpu.max_batch_size)
 """
 
-from functools import lru_cache  # lru_cache ensures singleton behavior for settings
-from typing import List, Optional  # Type hints for configuration fields
+from __future__ import annotations
 
-from pydantic import Field, field_validator  # Field for defaults, validator for custom rules
-from pydantic_settings import BaseSettings  # BaseSettings auto-loads from environment
+from functools import lru_cache
+from typing import List, Optional
+
+from pydantic import Field, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class Settings(BaseSettings):
-    """
-    Central configuration class for the entire ECTP platform.
+# ---------------------------------------------------------------------------
+# Nested settings groups
+# ---------------------------------------------------------------------------
 
-    HOW IT WORKS:
-        1. Reads environment variables matching field names (with ECTP_ prefix)
-        2. Falls back to defaults defined here if env var is not set
-        3. Validates types and constraints automatically
-        4. Raises clear errors if required config is missing
+class AppSettings(BaseSettings):
+    """Core application identity and runtime settings."""
 
-    USAGE:
-        from src.core.config import settings
-        print(settings.app_name)  # Reads ECTP_APP_NAME env var
-    """
+    model_config = SettingsConfigDict(env_prefix="APP_")
 
-    # ---- Application Settings ----
-    # These control the core behavior of the application server
+    name: str = Field(default="netflix-llm-platform", description="Application name")
+    version: str = Field(default="1.0.0", description="Application version")
+    environment: str = Field(default="development", description="Runtime environment (development|staging|production)")
+    debug: bool = Field(default=False, description="Enable debug mode")
+    host: str = Field(default="0.0.0.0", description="Server bind host")
+    port: int = Field(default=8000, description="Server bind port")
 
-    # app_name: Identifies this application in logs, metrics, and service discovery.
-    # Why: Every enterprise service needs a unique identifier for observability.
-    app_name: str = Field(
-        default="ECTP",
-        description="Application name used in logs and service discovery"
+    @field_validator("environment")
+    @classmethod
+    def validate_environment(cls, v: str) -> str:
+        allowed = {"development", "staging", "production"}
+        if v not in allowed:
+            raise ValueError(f"environment must be one of {allowed}, got '{v}'")
+        return v
+
+
+class GPUSettings(BaseSettings):
+    """GPU acceleration and batching configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="GPU_")
+
+    enable_gpu: bool = Field(default=True, description="Enable GPU acceleration")
+    device_ids: List[int] = Field(default=[0], description="CUDA device IDs to use")
+    tensor_parallel_size: int = Field(default=1, description="Tensor parallelism degree")
+    memory_fraction: float = Field(
+        default=0.90,
+        ge=0.1,
+        le=1.0,
+        description="Fraction of GPU memory to allocate",
+    )
+    max_batch_size: int = Field(default=64, ge=1, description="Maximum inference batch size")
+    dynamic_batching: bool = Field(
+        default=True,
+        description="Enable dynamic batching to maximise throughput",
     )
 
-    # app_version: Semantic version of the running application.
-    # Why: Critical for debugging — knowing which version produced an error.
-    app_version: str = Field(
-        default="1.0.0",
-        description="Application version following semver"
+
+class TritonSettings(BaseSettings):
+    """NVIDIA Triton Inference Server connection settings."""
+
+    model_config = SettingsConfigDict(env_prefix="TRITON_")
+
+    server_url: str = Field(
+        default="localhost:8001",
+        description="Triton gRPC endpoint",
+    )
+    model_name: str = Field(
+        default="ensemble_llm",
+        description="Triton model repository name",
+    )
+    model_version: str = Field(default="1", description="Model version to serve")
+    max_queue_delay_ms: int = Field(
+        default=100,
+        ge=0,
+        description="Maximum queue delay in milliseconds before flushing a batch",
     )
 
-    # env: The deployment environment (development, qa, uat, production).
-    # Why: Controls behavior like debug mode, log verbosity, and feature flags.
-    env: str = Field(
-        default="development",
-        description="Deployment environment name"
+
+class ModelSettings(BaseSettings):
+    """LLM model configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="MODEL_")
+
+    model_name: str = Field(
+        default="meta-llama/Llama-3-70B-Instruct",
+        description="HuggingFace model identifier or local path",
+    )
+    quantization: Optional[str] = Field(
+        default=None,
+        description="Quantization method (awq|gptq|fp8|None)",
+    )
+    max_sequence_length: int = Field(
+        default=4096,
+        ge=1,
+        description="Maximum input+output sequence length",
+    )
+    kv_cache_max_tokens: int = Field(
+        default=32768,
+        ge=1,
+        description="Maximum tokens stored in the KV cache",
+    )
+    kv_cache_ttl_seconds: int = Field(
+        default=300,
+        ge=0,
+        description="Time-to-live for KV cache entries in seconds",
     )
 
-    # debug: Enables detailed error responses and auto-reload.
-    # Why: Speeds up development but MUST be False in production for security.
-    # Security: Debug mode exposes stack traces — never enable in production.
-    debug: bool = Field(
+    @field_validator("quantization")
+    @classmethod
+    def validate_quantization(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            allowed = {"awq", "gptq", "fp8"}
+            if v.lower() not in allowed:
+                raise ValueError(f"quantization must be one of {allowed}, got '{v}'")
+            return v.lower()
+        return v
+
+
+class RedisSettings(BaseSettings):
+    """Redis connection and session cache settings."""
+
+    model_config = SettingsConfigDict(env_prefix="REDIS_")
+
+    url: str = Field(
+        default="redis://localhost:6379/0",
+        description="Redis connection URL",
+    )
+    cluster_enabled: bool = Field(
         default=False,
-        description="Enable debug mode (NEVER true in production)"
+        description="Connect to a Redis Cluster instead of standalone",
+    )
+    max_connections: int = Field(
+        default=50,
+        ge=1,
+        description="Maximum connections in the pool",
+    )
+    session_ttl_seconds: int = Field(
+        default=1800,
+        ge=0,
+        description="Session data TTL in seconds (default 30 min)",
     )
 
-    # log_level: Controls logging verbosity (DEBUG, INFO, WARNING, ERROR, CRITICAL).
-    # Why: DEBUG in dev for troubleshooting, WARNING+ in prod to reduce noise.
-    log_level: str = Field(
-        default="INFO",
-        description="Logging level"
+
+class AWSSettings(BaseSettings):
+    """AWS service configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="AWS_")
+
+    region: str = Field(default="us-east-1", description="Primary AWS region")
+    dynamodb_user_table: str = Field(
+        default="netflix-llm-user-profiles",
+        description="DynamoDB table for user profile data",
+    )
+    dynamodb_session_table: str = Field(
+        default="netflix-llm-sessions",
+        description="DynamoDB table for session state",
+    )
+    dynamodb_model_table: str = Field(
+        default="netflix-llm-model-metadata",
+        description="DynamoDB table for model metadata",
+    )
+    s3_bucket: str = Field(
+        default="netflix-llm-artifacts",
+        description="S3 bucket for model weights and artifacts",
     )
 
-    # host: The network interface the server binds to.
-    # Why: 0.0.0.0 allows connections from any interface (needed in containers).
-    host: str = Field(
-        default="0.0.0.0",
-        description="Server bind host"
+
+class ObservabilitySettings(BaseSettings):
+    """Observability stack configuration (Prometheus, DCGM, OpenTelemetry)."""
+
+    model_config = SettingsConfigDict(env_prefix="OBS_")
+
+    prometheus_enabled: bool = Field(default=True, description="Enable Prometheus metrics")
+    prometheus_port: int = Field(default=9090, description="Prometheus metrics port")
+    dcgm_enabled: bool = Field(
+        default=True,
+        description="Enable NVIDIA DCGM GPU metrics exporter",
+    )
+    dcgm_port: int = Field(default=9400, description="DCGM exporter port")
+    otel_enabled: bool = Field(
+        default=True,
+        description="Enable OpenTelemetry tracing",
+    )
+    otel_exporter_endpoint: str = Field(
+        default="http://localhost:4317",
+        description="OTLP gRPC exporter endpoint",
+    )
+    otel_service_name: str = Field(
+        default="netflix-llm-platform",
+        description="OTel service name tag",
+    )
+    otel_sample_rate: float = Field(
+        default=0.1,
+        ge=0.0,
+        le=1.0,
+        description="Trace sampling rate (0.0 - 1.0)",
     )
 
-    # port: The TCP port the server listens on.
-    # Why: 8000 is the standard for Python web apps, avoids conflicts with 80/443.
-    port: int = Field(
-        default=8000,
-        description="Server bind port"
+
+class MultiRegionSettings(BaseSettings):
+    """Multi-region deployment and failover configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="REGION_")
+
+    primary_region: str = Field(default="us-east-1", description="Primary serving region")
+    secondary_regions: List[str] = Field(
+        default=["us-west-2", "eu-west-1"],
+        description="Ordered list of failover regions",
+    )
+    failover_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        description="Seconds to wait before triggering failover",
+    )
+    health_check_interval_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        description="Interval between cross-region health probes",
     )
 
-    # ---- Database Settings ----
-    # PostgreSQL connection configuration for the primary data store
 
-    # db_host: Database server hostname.
-    # Why: Separate from app server for security isolation and scaling.
-    db_host: str = Field(
-        default="localhost",
-        description="PostgreSQL host"
+class RateLimitSettings(BaseSettings):
+    """API rate limiting configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="RATE_LIMIT_")
+
+    enabled: bool = Field(default=True, description="Enable rate limiting")
+    requests_per_minute: int = Field(
+        default=60,
+        ge=1,
+        description="Maximum requests per minute per client",
     )
-
-    # db_port: PostgreSQL default port.
-    # Why: 5432 is the standard PostgreSQL port.
-    db_port: int = Field(
-        default=5432,
-        description="PostgreSQL port"
-    )
-
-    # db_name: The specific database within PostgreSQL.
-    # Why: Each environment gets its own database for data isolation.
-    db_name: str = Field(
-        default="ectp",
-        description="PostgreSQL database name"
-    )
-
-    # db_user: Database authentication username.
-    # Why: Principle of least privilege — dedicated user with minimal permissions.
-    db_user: str = Field(
-        default="ectp_user",
-        description="PostgreSQL username"
-    )
-
-    # db_password: Database authentication password.
-    # Why: Loaded from env var, never hardcoded. Rotated via Secrets Manager in prod.
-    # Security: This value is never logged or included in error responses.
-    db_password: str = Field(
-        default="",
-        description="PostgreSQL password (from env var or Secrets Manager)"
-    )
-
-    # db_pool_size: Number of persistent database connections.
-    # Why: Connection pooling avoids the overhead of creating new connections per request.
-    # 10 is a good default; increase for high-throughput services.
-    db_pool_size: int = Field(
+    burst_size: int = Field(
         default=10,
-        description="SQLAlchemy connection pool size"
+        ge=1,
+        description="Token bucket burst allowance",
+    )
+    backend: str = Field(
+        default="redis",
+        description="Rate limit backend (redis|memory)",
     )
 
-    # db_max_overflow: Extra connections allowed beyond pool_size during peak load.
-    # Why: Handles traffic spikes without rejecting requests. These connections are
-    # temporary and returned to the pool after use.
-    db_max_overflow: int = Field(
-        default=20,
-        description="Maximum overflow connections beyond pool size"
-    )
 
-    # ---- Redis Settings ----
-    # Redis configuration for caching, session management, and message brokering
+class SecuritySettings(BaseSettings):
+    """Security, authentication, and encryption settings."""
 
-    # redis_host: Redis server hostname.
-    # Why: ElastiCache in AWS, localhost for development.
-    redis_host: str = Field(
-        default="localhost",
-        description="Redis host"
-    )
+    model_config = SettingsConfigDict(env_prefix="SECURITY_")
 
-    # redis_port: Redis default port.
-    redis_port: int = Field(
-        default=6379,
-        description="Redis port"
-    )
-
-    # redis_db: Redis database number (0-15).
-    # Why: Logical separation within a single Redis instance.
-    redis_db: int = Field(
-        default=0,
-        description="Redis database number"
-    )
-
-    # redis_password: Redis authentication (empty for local dev).
-    # Security: Required in production (ElastiCache AUTH).
-    redis_password: str = Field(
-        default="",
-        description="Redis password"
-    )
-
-    # ---- AWS Settings ----
-    # AWS configuration for cloud service integration
-
-    # aws_region: The AWS region where resources are deployed.
-    # Why: us-east-1 is the most feature-complete region and common for Higher Ed.
-    aws_region: str = Field(
-        default="us-east-1",
-        description="AWS region for API calls"
-    )
-
-    # aws_account_id: The AWS account number.
-    # Why: Needed for constructing ARNs and cross-account access.
-    aws_account_id: str = Field(
-        default="",
-        description="AWS account ID"
-    )
-
-    # ---- ServiceNow Settings ----
-    # ServiceNow ITSM integration configuration
-
-    # servicenow_instance_url: The ServiceNow instance URL.
-    # Why: Each organization has a unique ServiceNow instance.
-    servicenow_instance_url: str = Field(
-        default="",
-        description="ServiceNow instance URL"
-    )
-
-    # servicenow_client_id: OAuth2 client ID for ServiceNow API.
-    # Why: OAuth2 is ServiceNow's recommended authentication method for integrations.
-    servicenow_client_id: str = Field(
-        default="",
-        description="ServiceNow OAuth2 client ID"
-    )
-
-    # servicenow_client_secret: OAuth2 client secret.
-    # Security: Stored in Secrets Manager in production, env var in dev.
-    servicenow_client_secret: str = Field(
-        default="",
-        description="ServiceNow OAuth2 client secret"
-    )
-
-    # ---- Ellucian Settings ----
-    # Ellucian Ethos platform integration for Higher Ed systems
-
-    # ellucian_ethos_api_url: Base URL for the Ellucian Ethos Integration API.
-    # Why: Ethos is the standard integration platform for Banner/Colleague.
-    ellucian_ethos_api_url: str = Field(
-        default="",
-        description="Ellucian Ethos API base URL"
-    )
-
-    # ellucian_api_key: API key for Ethos authentication.
-    # Security: Rotated quarterly, stored in Secrets Manager in production.
-    ellucian_api_key: str = Field(
-        default="",
-        description="Ellucian Ethos API key"
-    )
-
-    # ---- JWT Settings ----
-    # JSON Web Token configuration for API authentication
-
-    # jwt_secret_key: The secret used to sign JWT tokens.
-    # Security: MUST be a strong random string (256+ bits). If compromised,
-    # all tokens can be forged. Rotate immediately if suspected leak.
     jwt_secret_key: str = Field(
         default="CHANGE-ME-IN-PRODUCTION",
-        description="JWT signing secret (must be strong random string)"
+        description="JWT signing secret (use a strong secret in production)",
     )
-
-    # jwt_algorithm: The algorithm used to sign JWT tokens.
-    # Why: HS256 (HMAC-SHA256) is fast and suitable for single-service auth.
-    # Alternative: RS256 for multi-service (uses asymmetric keys).
-    jwt_algorithm: str = Field(
-        default="HS256",
-        description="JWT signing algorithm"
-    )
-
-    # jwt_access_token_expire_minutes: How long access tokens are valid.
-    # Why: Short-lived tokens (30 min) limit damage from token theft.
-    # Users get new tokens via refresh tokens without re-authenticating.
-    jwt_access_token_expire_minutes: int = Field(
+    jwt_algorithm: str = Field(default="HS256", description="JWT signing algorithm")
+    jwt_expiration_minutes: int = Field(
         default=30,
-        description="Access token expiration in minutes"
+        ge=1,
+        description="JWT token expiration in minutes",
+    )
+    encryption_key: str = Field(
+        default="CHANGE-ME-IN-PRODUCTION",
+        description="Fernet / AES encryption key for data at rest",
+    )
+    mtls_enabled: bool = Field(
+        default=False,
+        description="Require mutual TLS for service-to-service calls",
+    )
+    mtls_cert_path: Optional[str] = Field(
+        default=None,
+        description="Path to mTLS client certificate",
+    )
+    mtls_key_path: Optional[str] = Field(
+        default=None,
+        description="Path to mTLS client private key",
+    )
+    mtls_ca_path: Optional[str] = Field(
+        default=None,
+        description="Path to mTLS CA bundle",
     )
 
-    # ---- CORS Settings ----
-    # Cross-Origin Resource Sharing configuration
 
-    # cors_origins: List of allowed origins for cross-origin requests.
-    # Why: Restricts which frontends can call the API (security boundary).
-    # Security: Never use "*" in production — explicitly list allowed origins.
-    cors_origins: str = Field(
-        default="http://localhost:3000",
-        description="Comma-separated list of allowed CORS origins"
+# ---------------------------------------------------------------------------
+# Root settings aggregator
+# ---------------------------------------------------------------------------
+
+class Settings(BaseSettings):
+    """Root configuration object that aggregates all sub-settings.
+
+    Environment variables are loaded automatically. Each sub-settings group
+    uses its own prefix (``APP_``, ``GPU_``, ``TRITON_``, etc.).
+    """
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
     )
 
-    @field_validator("log_level")
-    @classmethod
-    def validate_log_level(cls, v: str) -> str:
-        """
-        Validates that log_level is one of the standard Python logging levels.
-
-        WHY: Prevents typos (e.g., 'DEBU' instead of 'DEBUG') that would
-        silently default to WARNING, making debugging impossible.
-        """
-        allowed = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
-        # Convert to uppercase for case-insensitive comparison.
-        # This is a usability improvement — 'debug' works same as 'DEBUG'.
-        upper_v = v.upper()
-        if upper_v not in allowed:
-            raise ValueError(
-                f"log_level must be one of {allowed}, got '{v}'"
-            )
-        return upper_v
-
-    @field_validator("env")
-    @classmethod
-    def validate_env(cls, v: str) -> str:
-        """
-        Validates the environment name against known environments.
-
-        WHY: Catches configuration errors early. A typo like 'producton'
-        could cause the app to run with development settings in production.
-        """
-        allowed = {"development", "qa", "uat", "production"}
-        lower_v = v.lower()
-        if lower_v not in allowed:
-            raise ValueError(
-                f"env must be one of {allowed}, got '{v}'"
-            )
-        return lower_v
-
-    @property
-    def database_url(self) -> str:
-        """
-        Constructs the async PostgreSQL connection string.
-
-        WHY: Centralizes DB URL construction to avoid format errors.
-        Uses asyncpg driver for async SQLAlchemy compatibility.
-
-        Returns:
-            Async PostgreSQL connection URL string.
-        """
-        # postgresql+asyncpg:// tells SQLAlchemy to use the asyncpg driver
-        # which supports Python's async/await for non-blocking DB operations.
-        return (
-            f"postgresql+asyncpg://{self.db_user}:{self.db_password}"
-            f"@{self.db_host}:{self.db_port}/{self.db_name}"
-        )
-
-    @property
-    def redis_url(self) -> str:
-        """
-        Constructs the Redis connection URL.
-
-        WHY: Centralizes Redis URL construction for consistency
-        across cache client, Celery broker, and session store.
-
-        Returns:
-            Redis connection URL string.
-        """
-        if self.redis_password:
-            # Include password in URL when authentication is required
-            return (
-                f"redis://:{self.redis_password}@{self.redis_host}"
-                f":{self.redis_port}/{self.redis_db}"
-            )
-        # No password for local development
-        return f"redis://{self.redis_host}:{self.redis_port}/{self.redis_db}"
-
-    @property
-    def cors_origins_list(self) -> List[str]:
-        """
-        Parses the comma-separated CORS origins string into a list.
-
-        WHY: Environment variables are strings, but FastAPI's CORSMiddleware
-        expects a list. This property handles the conversion.
-
-        Returns:
-            List of allowed origin URLs.
-        """
-        return [origin.strip() for origin in self.cors_origins.split(",")]
+    app: AppSettings = Field(default_factory=AppSettings)
+    gpu: GPUSettings = Field(default_factory=GPUSettings)
+    triton: TritonSettings = Field(default_factory=TritonSettings)
+    model: ModelSettings = Field(default_factory=ModelSettings)
+    redis: RedisSettings = Field(default_factory=RedisSettings)
+    aws: AWSSettings = Field(default_factory=AWSSettings)
+    observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
+    multi_region: MultiRegionSettings = Field(default_factory=MultiRegionSettings)
+    rate_limit: RateLimitSettings = Field(default_factory=RateLimitSettings)
+    security: SecuritySettings = Field(default_factory=SecuritySettings)
 
     @property
     def is_production(self) -> bool:
-        """
-        Checks if the application is running in production.
-
-        WHY: Many features should behave differently in production:
-        - Debug mode disabled
-        - Verbose logging reduced
-        - Security checks stricter
-
-        Returns:
-            True if running in production environment.
-        """
-        return self.env == "production"
-
-    class Config:
-        """
-        Pydantic Settings configuration.
-
-        env_prefix: All env vars must start with 'ECTP_' to avoid conflicts
-                   with other applications on the same system.
-        env_file: Automatically loads .env file for local development.
-        case_sensitive: Env var names are case-insensitive (standard behavior).
-        """
-        env_prefix = "ECTP_"
-        env_file = ".env"
-        case_sensitive = False
+        """Return ``True`` when running in the production environment."""
+        return self.app.environment == "production"
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """
-    Returns a cached singleton instance of Settings.
+    """Return the cached singleton ``Settings`` instance.
 
-    WHY: We use @lru_cache to ensure only ONE Settings object exists
-    throughout the application lifecycle. This:
-    1. Prevents reading .env file multiple times
-    2. Ensures all modules see the same configuration
-    3. Makes testing easier (can override with dependency injection)
-
-    ALTERNATIVE: Global variable — rejected because lru_cache is
-    more explicit and can be cleared for testing.
-
-    Returns:
-        The singleton Settings instance.
+    The first call constructs the object (reading env vars / .env);
+    subsequent calls return the same instance from the LRU cache.
     """
     return Settings()

@@ -1,458 +1,331 @@
-<div align="center">
+# Netflix Real-Time LLM Personalization & Inference Platform
+# API Design Standards
 
-# ECTP API Design Standards
-
-```
-╔══════════════════════════════════════════════════════════════════╗
-║                  ECTP API DESIGN STANDARDS                      ║
-║               Enterprise Cloud Transformation Platform          ║
-╚══════════════════════════════════════════════════════════════════╝
-```
-
+**Document ID:** NFLX-LLM-API-001
 **Author:** Gopi Krishna Vajrala
-**Version:** 1.0.0
-**Last Updated:** 2026-02-16
-
-</div>
+**Version:** 2.0.0
+**Date:** 2026-02-21
 
 ---
 
-## API Request/Response Flow
+## 1. Protocol Selection: gRPC vs REST
 
-```
-API REQUEST/RESPONSE LIFECYCLE
-══════════════════════════════════════════════════════════════════════════════
+### Decision Matrix
 
-  Client                    API Gateway              Backend Service
-    │                           │                          │
-    │   HTTP Request            │                          │
-    │   + Bearer Token          │                          │
-    │ ─────────────────────►    │                          │
-    │                           │  Auth + Rate Limit       │
-    │                           │  Validation              │
-    │                           │ ────────────────────►    │
-    │                           │                          │  Process
-    │                           │                          │  Request
-    │                           │    JSON Response         │
-    │                           │ ◄────────────────────    │
-    │   HTTP Response           │                          │
-    │   + Status Code           │                          │
-    │   + Rate Limit Headers    │                          │
-    │ ◄─────────────────────    │                          │
-    │                           │                          │
+| Criteria | gRPC | REST (HTTP/JSON) | Decision |
+|----------|------|-------------------|----------|
+| **Real-time inference** | Preferred (binary, streaming) | Acceptable | **gRPC** for internal services |
+| **Client-facing API** | Complex client setup | Universal support | **REST** for external clients |
+| **Batch inference** | Bidirectional streaming | Single request/response | **gRPC** for batch |
+| **Model status / health** | Overkill | Simple and sufficient | **REST** for health/status |
+| **Latency (p99)** | ~2ms overhead | ~5ms overhead | **gRPC** for latency-critical |
+| **Observability** | Requires interceptors | Native HTTP tracing | **REST** for observability |
 
-══════════════════════════════════════════════════════════════════════════════
-```
+### Protocol Assignment
+
+| Endpoint Category | Protocol | Justification |
+|-------------------|----------|---------------|
+| Real-time prediction | gRPC | Sub-50ms latency budget; binary protobuf reduces serialization overhead |
+| Batch prediction | gRPC | Bidirectional streaming for large batch jobs |
+| Model management | REST | Low frequency; developer ergonomics preferred |
+| Health checks | REST | Standard HTTP health checks for load balancers |
+| Metrics / status | REST | Prometheus-compatible scraping |
+| External client API | REST | Universal client compatibility (mobile, web, microservices) |
 
 ---
 
-## URL Structure
+## 2. Latency Budget Allocation
 
-> **Convention:** All endpoints follow RESTful naming with URL-based versioning
+Total end-to-end latency target: **50ms (p99)**
 
 ```
-BASE PATTERN:  /api/v{version}/{resource}
-══════════════════════════════════════════════════════════════
+LATENCY BUDGET BREAKDOWN (50ms total)
+================================================================
 
-  /api/v1/migration/plans          Migration planning
-  /api/v1/servicenow/incidents     ServiceNow integration
-  /api/v1/ellucian/students        Ellucian student data
-  /api/v1/cost/summary             Cost governance
+Component                 Budget (ms)    Target p99 (ms)
+----------------------------------------------------------------
+TLS termination              1                0.5
+API Gateway (auth, routing)  2                1.0
+Request validation           1                0.5
+Feature assembly (cache)     5                3.0
+Prediction cache lookup      1                0.5
+GPU inference (forward pass) 30               25.0
+Post-processing              3                2.0
+Response serialization       2                1.5
+Network overhead             5                3.0
+----------------------------------------------------------------
+TOTAL                       50               37.0
 
-══════════════════════════════════════════════════════════════
+================================================================
 ```
 
-| Component | Convention | Example |
-|-----------|-----------|---------|
-| Base path | `/api` | `/api/...` |
-| Version | `/v{major}` | `/api/v1/...` |
-| Resource | Plural nouns, lowercase | `/api/v1/migration/plans` |
-| Sub-resource | Nested path | `/api/v1/plans/{id}/tasks` |
+### Latency Monitoring
+
+| Metric | Alert Threshold | Escalation |
+|--------|----------------|------------|
+| p50 latency | > 15ms | Slack notification |
+| p90 latency | > 35ms | Slack + on-call page |
+| p99 latency | > 50ms | PagerDuty P2 |
+| p99.9 latency | > 100ms | PagerDuty P1 |
+| GPU inference time | > 30ms | ML team notification |
 
 ---
 
-## HTTP Methods
+## 3. Inference API Endpoints
 
-> Each method is color-coded by its operational semantics
-
-| | Method | Usage | Idempotent | Request Body | Typical Response |
-|---|---|---|---|---|---|
-| :green_circle: | **`GET`** | Read resource(s) | Yes | No | `200 OK` |
-| :blue_circle: | **`POST`** | Create resource | No | Yes | `201 Created` |
-| :orange_circle: | **`PUT`** | Full update (replace) | Yes | Yes | `200 OK` |
-| :yellow_circle: | **`PATCH`** | Partial update | Yes | Yes | `200 OK` |
-| :red_circle: | **`DELETE`** | Remove resource | Yes | No | `204 No Content` |
+### 3.1 REST Endpoints
 
 ```
-HTTP METHODS VISUAL GUIDE
-══════════════════════════════════════════════════════════════════
+BASE URL: https://llm-inference-{region}.netflix.internal/v1
+================================================================
 
-  GET     ■■■■■■■■■■  Read-only, safe, cacheable
-  POST    ■■■■■■■■■■  Creates new resource, not idempotent
-  PUT     ■■■■■■■■■■  Full replacement, idempotent
-  PATCH   ■■■■■■■■■■  Partial update, idempotent
-  DELETE  ■■■■■■■■■■  Removes resource, idempotent
+POST /v1/predict              Real-time single prediction
+POST /v1/recommend            Content recommendation list
+POST /v1/embed                Generate embedding vector
+GET  /v1/models               List loaded models and status
+GET  /v1/models/{model_id}    Get specific model details
+GET  /health                  Health check (HTTP 200 = healthy)
+GET  /health/ready            Readiness probe (GPU loaded)
+GET  /health/live             Liveness probe (process alive)
+GET  /metrics                 Prometheus metrics endpoint
 
-══════════════════════════════════════════════════════════════════
+================================================================
 ```
 
-### Usage Examples
+### 3.2 gRPC Service Definition
 
-<details>
-<summary><strong>:green_circle: GET - Read Resources</strong></summary>
+```protobuf
+service InferenceService {
+  // Real-time single prediction (< 50ms p99)
+  rpc Predict(PredictRequest) returns (PredictResponse);
 
-```bash
-# List all migration plans
-GET /api/v1/migration/plans
+  // Batch prediction via streaming
+  rpc BatchPredict(stream PredictRequest) returns (stream PredictResponse);
 
-# Get a specific plan
-GET /api/v1/migration/plans/123
-```
+  // Generate embedding vector
+  rpc Embed(EmbedRequest) returns (EmbedResponse);
 
-</details>
-
-<details>
-<summary><strong>:blue_circle: POST - Create Resource</strong></summary>
-
-```bash
-# Create a new migration plan
-POST /api/v1/migration/plans
-Content-Type: application/json
-
-{
-    "name": "Phase 2 Migration",
-    "target_date": "2026-06-01"
+  // Health check (gRPC health protocol)
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
 }
 ```
 
-</details>
-
-<details>
-<summary><strong>:orange_circle: PUT - Full Update</strong></summary>
-
-```bash
-# Replace an entire migration plan
-PUT /api/v1/migration/plans/123
-Content-Type: application/json
-
-{
-    "name": "Phase 2 Migration (Updated)",
-    "target_date": "2026-07-01",
-    "status": "in_progress"
-}
-```
-
-</details>
-
-<details>
-<summary><strong>:red_circle: DELETE - Remove Resource</strong></summary>
-
-```bash
-# Delete a migration plan
-DELETE /api/v1/migration/plans/123
-
-# Response: 204 No Content
-```
-
-</details>
-
 ---
 
-## Response Format
+## 4. Request / Response Format
 
-> **All API responses follow a consistent envelope structure**
-
-### Success Response
+### 4.1 Prediction Request (REST)
 
 ```json
+POST /v1/predict
+Content-Type: application/json
+
 {
-    "data": {
-        "id": "plan-123",
-        "name": "Phase 2 Migration",
-        "status": "active"
+    "user_id": "u-12345678",
+    "context": {
+        "page": "homepage",
+        "device": "smart_tv",
+        "time_of_day": "evening",
+        "session_id": "sess-abc123"
     },
-    "meta": {
-        "timestamp": "2026-02-16T12:00:00Z",
-        "correlation_id": "abc123"
+    "content_ids": ["tt-001", "tt-002", "tt-003"],
+    "model_version": "v2.3.0",
+    "options": {
+        "num_results": 10,
+        "diversity_factor": 0.3,
+        "dry_run": false
     }
 }
 ```
 
-### Error Response
+### 4.2 Prediction Response
 
 ```json
 {
-    "error_code": "NOT_FOUND",
-    "message": "Resource not found",
-    "details": {
-        "resource": "migration_plan",
-        "id": "plan-999"
-    }
-}
-```
-
-```
-RESPONSE ENVELOPE STRUCTURE
-══════════════════════════════════════════════════════════════
-
-  Success Response              Error Response
-  ┌───────────────────┐         ┌───────────────────┐
-  │ {                 │         │ {                 │
-  │   "data": {...},  │         │   "error_code":   │
-  │   "meta": {       │         │     "NOT_FOUND",  │
-  │     "timestamp",  │         │   "message":      │
-  │     "correlation  │         │     "Resource...",│
-  │      _id"         │         │   "details": {}   │
-  │   }               │         │ }                 │
-  │ }                 │         └───────────────────┘
-  └───────────────────┘
-
-══════════════════════════════════════════════════════════════
-```
-
----
-
-## Status Codes
-
-### :green_circle: 2xx - Success
-
-| Code | Name | Usage | When to Use |
-|------|------|-------|-------------|
-| `200` | OK | Success | GET, PUT, PATCH success |
-| `201` | Created | Resource created | POST success |
-| `204` | No Content | Deleted | DELETE success |
-
-### :orange_circle: 4xx - Client Error
-
-| Code | Name | Usage | When to Use |
-|------|------|-------|-------------|
-| `400` | Bad Request | Invalid input | Malformed request body |
-| `401` | Unauthorized | Not authenticated | Missing or invalid token |
-| `403` | Forbidden | Not authorized | Insufficient permissions |
-| `404` | Not Found | Resource missing | Resource does not exist |
-| `422` | Validation Error | Business rule violation | Data validation failure |
-| `429` | Rate Limited | Too many requests | Rate limit exceeded |
-
-### :red_circle: 5xx - Server Error
-
-| Code | Name | Usage | When to Use |
-|------|------|-------|-------------|
-| `500` | Internal Error | Server failure | Unexpected server error |
-| `502` | External Service Error | Upstream failure | ServiceNow, Ellucian down |
-
-```
-STATUS CODE DECISION TREE
-══════════════════════════════════════════════════════════════
-
-  Request Received
-       │
-       ├── Authenticated? ──No──► 401 Unauthorized
-       │
-       ├── Authorized? ──No──► 403 Forbidden
-       │
-       ├── Valid Input? ──No──► 400 Bad Request
-       │
-       ├── Resource Exists? ──No──► 404 Not Found
-       │
-       ├── Business Rules Pass? ──No──► 422 Validation Error
-       │
-       ├── Rate Limit OK? ──No──► 429 Rate Limited
-       │
-       ├── Server OK? ──No──► 500 Internal Error
-       │
-       ├── Upstream OK? ──No──► 502 External Service Error
-       │
-       └── Success ──► 200 / 201 / 204
-
-══════════════════════════════════════════════════════════════
-```
-
----
-
-## Pagination
-
-> **Offset-based pagination for list endpoints**
-
-```
-PAGINATION FLOW
-══════════════════════════════════════════════════════════════
-
-  Page 1              Page 2              Page 3
-  offset=0            offset=50           offset=100
-  limit=50            limit=50            limit=50
-  ┌──────────┐        ┌──────────┐        ┌──────────┐
-  │ Items    │        │ Items    │        │ Items    │
-  │ 1 - 50   │───────►│ 51 - 100 │───────►│101 - 150 │
-  └──────────┘        └──────────┘        └──────────┘
-
-══════════════════════════════════════════════════════════════
-```
-
-### Request
-
-```
-GET /api/v1/migration/plans?limit=50&offset=100
-```
-
-### Pagination Parameters
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `limit` | integer | 50 | Number of items per page (max 100) |
-| `offset` | integer | 0 | Number of items to skip |
-
-### Response with Pagination Metadata
-
-```json
-{
-    "data": [...],
-    "meta": {
-        "timestamp": "2026-02-16T12:00:00Z",
-        "correlation_id": "abc123",
-        "pagination": {
-            "limit": 50,
-            "offset": 100,
-            "total": 250
+    "request_id": "req-7f8a9b0c",
+    "predictions": [
+        {
+            "content_id": "tt-001",
+            "score": 0.95,
+            "rank": 1,
+            "explanation": "Based on viewing history and genre preference"
+        },
+        {
+            "content_id": "tt-003",
+            "score": 0.87,
+            "rank": 2,
+            "explanation": "Trending in similar user cohort"
         }
+    ],
+    "metadata": {
+        "model_version": "v2.3.0",
+        "inference_time_ms": 23.4,
+        "cache_hit": false,
+        "gpu_id": "gpu-0",
+        "region": "us-east-1"
+    },
+    "timing": {
+        "total_ms": 31.2,
+        "feature_assembly_ms": 3.1,
+        "inference_ms": 23.4,
+        "post_processing_ms": 2.8,
+        "serialization_ms": 1.9
+    }
+}
+```
+
+### 4.3 Error Response
+
+```json
+{
+    "error": {
+        "code": "MODEL_UNAVAILABLE",
+        "message": "Requested model version v2.4.0 is not loaded",
+        "details": {
+            "requested_version": "v2.4.0",
+            "available_versions": ["v2.3.0", "v2.2.5"],
+            "region": "us-east-1"
+        },
+        "request_id": "req-7f8a9b0c",
+        "timestamp": "2026-02-21T12:00:00.000Z"
     }
 }
 ```
 
 ---
 
-## Versioning
+## 5. Status Codes
 
-> **URL-based versioning strategy for breaking changes only**
+### Success Codes (2xx)
 
-```
-API VERSIONING STRATEGY
-══════════════════════════════════════════════════════════════
+| Code | Name | Usage |
+|------|------|-------|
+| 200 | OK | Successful prediction, model status query |
+| 207 | Multi-Status | Batch prediction with partial results |
 
-  /api/v1/...    CURRENT ──── Actively maintained
-                                │
-                                │  12-month overlap
-                                │
-  /api/v2/...    NEXT    ──── Breaking changes only
-                                │
-                                │  After 12 months
-                                │
-  /api/v1/...    SUNSET  ──── Deprecated, then removed
+### Client Error Codes (4xx)
 
-══════════════════════════════════════════════════════════════
-```
+| Code | Name | Usage |
+|------|------|-------|
+| 400 | Bad Request | Malformed request body, invalid user_id format |
+| 401 | Unauthorized | Missing or invalid authentication token |
+| 403 | Forbidden | Insufficient permissions for requested model |
+| 404 | Not Found | Unknown model version or user_id |
+| 408 | Request Timeout | Inference exceeded latency budget |
+| 422 | Unprocessable Entity | Valid JSON but invalid inference parameters |
+| 429 | Too Many Requests | Rate limit exceeded |
 
-| Rule | Description |
-|------|-------------|
-| **URL-based** | Versioning via URL path (`/api/v1/`, `/api/v2/`) |
-| **Major versions only** | Only for breaking changes |
-| **Deprecation period** | Old versions supported for **12 months** after deprecation |
-| **Deprecation headers** | `Sunset` and `Deprecation` headers on deprecated versions |
+### Server Error Codes (5xx)
 
----
-
-## Authentication
-
-> **Multi-layer authentication supporting user and service-to-service calls**
-
-```
-AUTHENTICATION FLOW
-══════════════════════════════════════════════════════════════════
-
-  User Authentication (SAML 2.0 SSO)
-  ────────────────────────────────────
-  Browser ──► IdP (SAML) ──► Cognito ──► JWT Token ──► API
-
-  API Authentication (Bearer Token)
-  ──────────────────────────────────
-  Client ──► Authorization: Bearer <JWT> ──► API Gateway ──► Validate
-
-  Service-to-Service (API Key)
-  ────────────────────────────
-  Service A ──► X-API-Key: <key> ──► API Gateway ──► Service B
-
-══════════════════════════════════════════════════════════════════
-```
-
-| Method | Use Case | Header | Token Type |
-|--------|----------|--------|------------|
-| **Bearer Token (JWT)** | User API calls | `Authorization: Bearer <token>` | JWT via Cognito |
-| **API Keys** | Service-to-service | `X-API-Key: <key>` | Managed API key |
-| **SAML 2.0** | SSO federation | Browser redirect | SAML assertion |
-
-### Example Headers
-
-```http
-# User API call
-GET /api/v1/migration/plans HTTP/1.1
-Host: api.ectp.edu
-Authorization: Bearer eyJhbGciOiJSUzI1NiIs...
-Content-Type: application/json
-
-# Service-to-service call
-GET /api/v1/servicenow/incidents HTTP/1.1
-Host: api.ectp.edu
-X-API-Key: ectp-svc-key-abc123
-Content-Type: application/json
-```
+| Code | Name | Usage |
+|------|------|-------|
+| 500 | Internal Server Error | Unexpected inference failure |
+| 502 | Bad Gateway | GPU node unreachable |
+| 503 | Service Unavailable | Model loading in progress, GPU overloaded |
+| 504 | Gateway Timeout | Inference timeout (GPU hang) |
 
 ---
 
-## Rate Limiting
+## 6. Error Handling Standards
 
-> **Protect API availability with per-client rate limits**
+### Error Code Registry
 
-```
-RATE LIMITING VISUAL
-══════════════════════════════════════════════════════════════
+| Error Code | HTTP Status | Description | Client Action |
+|-----------|------------|-------------|---------------|
+| INVALID_REQUEST | 400 | Malformed request payload | Fix request format |
+| AUTH_REQUIRED | 401 | No authentication provided | Provide valid token |
+| PERMISSION_DENIED | 403 | Insufficient access rights | Request access from admin |
+| MODEL_NOT_FOUND | 404 | Model version does not exist | Use available version |
+| MODEL_UNAVAILABLE | 503 | Model not loaded on GPU | Retry with backoff |
+| GPU_OVERLOADED | 503 | All GPU resources busy | Retry with backoff |
+| INFERENCE_TIMEOUT | 504 | GPU inference timed out | Retry or reduce batch size |
+| RATE_LIMITED | 429 | Client rate limit exceeded | Wait and retry per Retry-After |
+| FEATURE_STORE_ERROR | 502 | Cannot reach feature store | Retry; fallback to default features |
+| INTERNAL_ERROR | 500 | Unexpected server error | Retry; report if persistent |
 
-  Client Requests per Minute (1000 max)
-  ──────────────────────────────────────
+### Retry Policy
 
-  0        250       500       750      1000
-  ├─────────┼─────────┼─────────┼─────────┤
-  │ ■■■■■■■■■■■■■■■■■■■■■■■■■  │         │
-  │         GREEN (OK)          │ YELLOW  │  RED
-  │         (0-750)             │(751-999)│ (1000+)
-  │                             │ Warning │  429
-  └─────────────────────────────┴─────────┘
+| Error Category | Retry | Backoff | Max Retries |
+|---------------|-------|---------|-------------|
+| 429 Rate Limited | Yes | Respect Retry-After header | 3 |
+| 503 Unavailable | Yes | Exponential (100ms, 200ms, 400ms) | 3 |
+| 504 Timeout | Yes | Exponential with jitter | 2 |
+| 500 Internal | Yes (idempotent only) | Exponential | 2 |
+| 4xx Client Error | No | N/A | 0 |
 
-══════════════════════════════════════════════════════════════
-```
+---
 
-| Parameter | Value |
-|-----------|-------|
-| **Rate limit** | 1000 requests per minute per client |
-| **Exceeded response** | `429 Too Many Requests` |
-| **Retry header** | `Retry-After: <seconds>` |
-| **Limit headers** | Included in every response |
+## 7. Rate Limiting Policies
 
-### Rate Limit Response Headers
+### Per-Client Limits
+
+| Client Tier | Rate Limit | Burst Limit | Quota (daily) |
+|------------|-----------|-------------|---------------|
+| Internal service (P0) | 50,000 req/min | 100,000 req/min | Unlimited |
+| Internal service (P1) | 10,000 req/min | 20,000 req/min | 50M req/day |
+| External partner | 1,000 req/min | 2,000 req/min | 5M req/day |
+| Development / testing | 100 req/min | 200 req/min | 100K req/day |
+
+### Rate Limit Headers
 
 ```http
 HTTP/1.1 200 OK
-X-RateLimit-Limit: 1000
-X-RateLimit-Remaining: 742
+X-RateLimit-Limit: 50000
+X-RateLimit-Remaining: 49234
 X-RateLimit-Reset: 1708099200
+X-RateLimit-Policy: internal-p0
 
-# When rate limited:
 HTTP/1.1 429 Too Many Requests
-Retry-After: 30
-X-RateLimit-Limit: 1000
+Retry-After: 5
+X-RateLimit-Limit: 50000
 X-RateLimit-Remaining: 0
 X-RateLimit-Reset: 1708099200
 ```
 
 ---
 
-<div align="center">
+## 8. Authentication
 
+| Method | Use Case | Header | Token Type |
+|--------|----------|--------|------------|
+| **mTLS** | Service-to-service (inference) | TLS client certificate | X.509 cert |
+| **Bearer Token (JWT)** | External API calls | `Authorization: Bearer <token>` | JWT via Netflix SSO |
+| **API Key** | Partner integrations | `X-API-Key: <key>` | Managed API key |
+
+---
+
+## 9. Versioning Strategy
+
+| Rule | Description |
+|------|-------------|
+| URL-based versioning | `/v1/predict`, `/v2/predict` |
+| Major versions only | New version only for breaking changes |
+| Model version in request | Client specifies desired model version in request body |
+| Deprecation period | 6 months minimum before removing old API version |
+| Sunset header | `Sunset: Sat, 01 Jan 2028 00:00:00 GMT` on deprecated versions |
+
+---
+
+## 10. Observability Standards
+
+### Required Headers
+
+Every response must include:
+
+```http
+X-Request-Id: req-7f8a9b0c         # Unique request identifier
+X-Inference-Time-Ms: 23.4          # GPU inference time
+X-Model-Version: v2.3.0            # Model used for prediction
+X-Cache-Status: MISS               # HIT or MISS
+X-Region: us-east-1                # Serving region
 ```
-══════════════════════════════════════════════════════════════
-                END OF API DESIGN STANDARDS
-            Enterprise Cloud Transformation Platform
-══════════════════════════════════════════════════════════════
-```
+
+### Distributed Tracing
+
+- All requests propagate OpenTelemetry trace context (`traceparent` header)
+- Spans recorded for: API Gateway, feature assembly, cache lookup, GPU inference, post-processing
+- Trace data exported to Jaeger / Tempo for analysis
+
+---
 
 **Author:** Gopi Krishna Vajrala
-
-</div>

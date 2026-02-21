@@ -1,0 +1,163 @@
+# =============================================================================
+# Netflix Real-Time LLM Platform - GPU-Aware HorizontalPodAutoscaler
+# =============================================================================
+# Autoscales the Triton Inference Server deployment based on GPU utilization
+# and inference queue depth. Uses custom metrics from DCGM and Triton.
+#
+# Scale-up:  GPU utilization > 80% OR inference queue > 100
+# Scale-down: GPU utilization < 40%
+# Min replicas: 2 | Max replicas: 20
+# =============================================================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: triton-gpu-hpa
+  namespace: netflix-llm
+  labels:
+    app.kubernetes.io/name: triton-gpu-hpa
+    app.kubernetes.io/component: autoscaling
+    app.kubernetes.io/part-of: netflix-llm-platform
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    app.kubernetes.io/description: "GPU-aware autoscaler for Triton Inference Server"
+    team: "netflix-ml-platform"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: triton-inference-server
+
+  minReplicas: 2
+  maxReplicas: 20
+
+  metrics:
+    # -----------------------------------------------------------------
+    # GPU Utilization metric from DCGM Exporter.
+    # Scale up when average GPU utilization exceeds 80%.
+    # -----------------------------------------------------------------
+    - type: Pods
+      pods:
+        metric:
+          name: DCGM_FI_DEV_GPU_UTIL
+        target:
+          type: AverageValue
+          averageValue: "80"
+
+    # -----------------------------------------------------------------
+    # Inference Queue Depth from Triton Inference Server.
+    # Scale up when the average pending request queue exceeds 100.
+    # -----------------------------------------------------------------
+    - type: Pods
+      pods:
+        metric:
+          name: nv_inference_queue_duration_us
+        target:
+          type: AverageValue
+          averageValue: "100"
+
+    # -----------------------------------------------------------------
+    # GPU Memory Utilization as a secondary scaling signal.
+    # Prevents OOM by scaling before GPU memory is exhausted.
+    # -----------------------------------------------------------------
+    - type: Pods
+      pods:
+        metric:
+          name: DCGM_FI_DEV_MEM_COPY_UTIL
+        target:
+          type: AverageValue
+          averageValue: "85"
+
+  behavior:
+    # -----------------------------------------------------------------
+    # Scale-up behavior: aggressive scaling to meet demand spikes.
+    # -----------------------------------------------------------------
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        # Allow adding up to 4 replicas per 60-second window.
+        - type: Pods
+          value: 4
+          periodSeconds: 60
+        # Allow doubling the current replica count per 60-second window.
+        - type: Percent
+          value: 100
+          periodSeconds: 60
+      selectPolicy: Max
+
+    # -----------------------------------------------------------------
+    # Scale-down behavior: conservative to avoid thrashing and cold-start
+    # penalties from GPU model loading.
+    # -----------------------------------------------------------------
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        # Remove at most 1 replica per 120-second window.
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+        # Remove at most 10% of replicas per 120-second window.
+        - type: Percent
+          value: 10
+          periodSeconds: 120
+      selectPolicy: Min
+
+---
+# =============================================================================
+# API Gateway HorizontalPodAutoscaler
+# =============================================================================
+# Autoscales the FastAPI gateway based on CPU utilization and request rate.
+# =============================================================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: netflix-llm-api-hpa
+  namespace: netflix-llm
+  labels:
+    app.kubernetes.io/name: netflix-llm-api-hpa
+    app.kubernetes.io/component: autoscaling
+    app.kubernetes.io/part-of: netflix-llm-platform
+  annotations:
+    app.kubernetes.io/description: "Autoscaler for Netflix LLM API gateway"
+    team: "netflix-ml-platform"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: netflix-llm-api
+
+  minReplicas: 3
+  maxReplicas: 30
+
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+      policies:
+        - type: Pods
+          value: 3
+          periodSeconds: 60
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 120
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 60
+      selectPolicy: Min

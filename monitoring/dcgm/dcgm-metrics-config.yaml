@@ -1,0 +1,382 @@
+# ============================================================================
+# Netflix Real-Time LLM Personalization & Inference Platform
+# DCGM (Data Center GPU Manager) Metrics Collection Configuration
+# ============================================================================
+# Configures NVIDIA DCGM exporter for GPU telemetry collection on the
+# inference fleet. Metrics are exported in Prometheus format and scraped
+# by the monitoring stack for dashboards and alerting.
+# ============================================================================
+
+# ==========================================================================
+# Global Settings
+# ==========================================================================
+global:
+  # DCGM exporter listen address for Prometheus scraping
+  exporter_listen: ":9400"
+  exporter_metrics_path: "/metrics"
+
+  # GPU device discovery
+  device_discovery:
+    method: "auto"
+    # If auto-discovery fails, specify GPU indices manually
+    # manual_devices: [0, 1, 2, 3]
+
+  # Default collection interval for metrics not in a specific group
+  default_collection_interval: "10s"
+
+  # Export format
+  export_format: "prometheus"
+
+  # Metric name prefix for all DCGM metrics
+  metric_prefix: "DCGM"
+
+  # Additional Prometheus labels applied to all exported metrics
+  extra_labels:
+    platform: "netflix-llm"
+    fleet: "inference"
+    cluster: "${CLUSTER_NAME}"
+    region: "${AWS_REGION}"
+
+# ==========================================================================
+# GPU Device Filters
+# ==========================================================================
+# Controls which GPU devices are monitored. Supports filtering by index,
+# UUID, PCI bus ID, or compute capability.
+# ==========================================================================
+device_filters:
+  # Include all GPUs by default
+  include_all: true
+
+  # Filter by GPU model (useful in heterogeneous clusters)
+  supported_models:
+    - "NVIDIA A100-SXM4-80GB"
+    - "NVIDIA H100 80GB HBM3"
+    - "NVIDIA L4"
+
+  # Exclude specific GPU indices (e.g., management GPUs)
+  exclude_indices: []
+
+  # Only monitor GPUs with active compute processes
+  # Set to false to monitor all GPUs including idle ones
+  active_only: false
+
+  # Tensor Parallelism group awareness
+  tensor_parallel:
+    enabled: true
+    group_size: 4  # TP=4 for the LLM inference configuration
+    label_name: "tp_rank"
+
+# ==========================================================================
+# Metric Collection Groups
+# ==========================================================================
+# Metrics are organized into groups with different collection intervals.
+# Critical metrics that affect real-time alerting use a 1s interval.
+# Standard metrics for dashboards and capacity planning use 10s.
+# ==========================================================================
+
+metric_groups:
+  # --------------------------------------------------------------------------
+  # Critical Metrics - 1 second collection interval
+  # These metrics are used for real-time alerting and must have low latency.
+  # --------------------------------------------------------------------------
+  critical:
+    collection_interval: "1s"
+    description: "High-frequency metrics for real-time alerting and SLO tracking"
+    metrics:
+
+      # GPU Utilization
+      - field_id: 203
+        name: "DCGM_FI_DEV_GPU_UTIL"
+        description: "GPU utilization as a percentage (0-100). Measures the fraction of time the GPU has active kernels."
+        type: "gauge"
+        unit: "percent"
+
+      # GPU Memory Utilization
+      - field_id: 204
+        name: "DCGM_FI_DEV_MEM_COPY_UTIL"
+        description: "Memory bandwidth utilization as a percentage (0-100). High values indicate memory-bound workloads."
+        type: "gauge"
+        unit: "percent"
+
+      # Framebuffer Memory Used
+      - field_id: 252
+        name: "DCGM_FI_DEV_FB_USED"
+        description: "Used framebuffer (HBM) memory in MiB. Critical for detecting OOM conditions in LLM inference."
+        type: "gauge"
+        unit: "MiB"
+
+      # Framebuffer Memory Free
+      - field_id: 251
+        name: "DCGM_FI_DEV_FB_FREE"
+        description: "Free framebuffer (HBM) memory in MiB. Monitors available memory for KV cache growth."
+        type: "gauge"
+        unit: "MiB"
+
+      # Framebuffer Memory Total
+      - field_id: 250
+        name: "DCGM_FI_DEV_FB_TOTAL"
+        description: "Total framebuffer (HBM) memory in MiB. Used for computing memory utilization percentages."
+        type: "gauge"
+        unit: "MiB"
+
+      # GPU Temperature
+      - field_id: 150
+        name: "DCGM_FI_DEV_GPU_TEMP"
+        description: "GPU die temperature in degrees Celsius. Thermal throttling begins at 83C on A100/H100."
+        type: "gauge"
+        unit: "celsius"
+
+      # SM Occupancy (Streaming Multiprocessor)
+      - field_id: 1002
+        name: "DCGM_FI_PROF_SM_OCCUPANCY"
+        description: >-
+          Ratio of active warps to maximum warps supported per SM (0.0-1.0).
+          Key indicator of kernel scheduling efficiency for inference workloads.
+          Low occupancy suggests suboptimal batch sizes or kernel configurations.
+        type: "gauge"
+        unit: "ratio"
+
+      # Tensor Core Utilization
+      - field_id: 1004
+        name: "DCGM_FI_PROF_PIPE_TENSOR_ACTIVE"
+        description: >-
+          Fraction of cycles the Tensor Cores are active (0.0-1.0). This is
+          the most important metric for LLM inference as it directly measures
+          how effectively the GPU is performing matrix multiply operations
+          for attention and feed-forward layers.
+        type: "gauge"
+        unit: "ratio"
+
+      # ECC Errors - Uncorrectable (Double Bit)
+      - field_id: 313
+        name: "DCGM_FI_DEV_ECC_DBE_VOL_TOTAL"
+        description: >-
+          Total uncorrectable (double-bit) ECC errors since driver load.
+          Any non-zero increase indicates failing GPU memory that can cause
+          silent data corruption. Requires immediate GPU replacement.
+        type: "counter"
+        unit: "errors"
+
+  # --------------------------------------------------------------------------
+  # Standard Metrics - 10 second collection interval
+  # These metrics are used for dashboards, capacity planning, and trending.
+  # --------------------------------------------------------------------------
+  standard:
+    collection_interval: "10s"
+    description: "Standard metrics for dashboards, trending, and capacity planning"
+    metrics:
+
+      # Memory Bandwidth Utilization
+      - field_id: 204
+        name: "DCGM_FI_DEV_MEM_COPY_UTIL"
+        description: "Memory copy engine utilization percentage. Indicates HBM bandwidth consumption."
+        type: "gauge"
+        unit: "percent"
+
+      # SM Clock Speed
+      - field_id: 100
+        name: "DCGM_FI_DEV_SM_CLOCK"
+        description: "Current SM clock frequency in MHz. Drops indicate thermal throttling or power limiting."
+        type: "gauge"
+        unit: "MHz"
+
+      # Memory Clock Speed
+      - field_id: 101
+        name: "DCGM_FI_DEV_MEM_CLOCK"
+        description: "Current memory clock frequency in MHz. Drops indicate memory thermal throttling."
+        type: "gauge"
+        unit: "MHz"
+
+      # Power Usage
+      - field_id: 155
+        name: "DCGM_FI_DEV_POWER_USAGE"
+        description: "Current GPU power draw in watts. Used for power capping awareness and cost modeling."
+        type: "gauge"
+        unit: "watts"
+
+      # Power Limit
+      - field_id: 156
+        name: "DCGM_FI_DEV_ENFORCED_POWER_LIMIT"
+        description: "Current enforced power limit in watts. Power throttling occurs when usage approaches this limit."
+        type: "gauge"
+        unit: "watts"
+
+      # ECC Errors - Correctable (Single Bit)
+      - field_id: 312
+        name: "DCGM_FI_DEV_ECC_SBE_VOL_TOTAL"
+        description: >-
+          Total correctable (single-bit) ECC errors since driver load.
+          Correctable errors are expected at low rates. High rates may
+          predict future uncorrectable errors and GPU failure.
+        type: "counter"
+        unit: "errors"
+
+      # PCIe Throughput - TX
+      - field_id: 409
+        name: "DCGM_FI_DEV_PCIE_TX_THROUGHPUT"
+        description: "PCIe transmit throughput in KB/s. Monitors host-to-device data transfer rates."
+        type: "gauge"
+        unit: "KB/s"
+
+      # PCIe Throughput - RX
+      - field_id: 410
+        name: "DCGM_FI_DEV_PCIE_RX_THROUGHPUT"
+        description: "PCIe receive throughput in KB/s. Monitors device-to-host data transfer rates."
+        type: "gauge"
+        unit: "KB/s"
+
+      # PCIe Replay Counter
+      - field_id: 411
+        name: "DCGM_FI_DEV_PCIE_REPLAY_COUNTER"
+        description: "PCIe replay counter. Rising values indicate PCIe link quality issues."
+        type: "counter"
+        unit: "replays"
+
+      # NVLink Throughput - TX
+      - field_id: 700
+        name: "DCGM_FI_DEV_NVLINK_BANDWIDTH_TX_TOTAL"
+        description: >-
+          Total NVLink transmit bandwidth in bytes/s across all links.
+          Critical for tensor-parallel inference where model layers are
+          split across GPUs. Low NVLink throughput causes TP synchronization
+          bottlenecks.
+        type: "gauge"
+        unit: "bytes/s"
+
+      # NVLink Throughput - RX
+      - field_id: 701
+        name: "DCGM_FI_DEV_NVLINK_BANDWIDTH_RX_TOTAL"
+        description: >-
+          Total NVLink receive bandwidth in bytes/s across all links.
+          Monitors the all-reduce communication pattern used in tensor-parallel
+          inference.
+        type: "gauge"
+        unit: "bytes/s"
+
+      # NVLink CRC Errors
+      - field_id: 702
+        name: "DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL"
+        description: "Total NVLink CRC flit errors. Non-zero indicates link quality degradation."
+        type: "counter"
+        unit: "errors"
+
+      # SM Activity (Profiling)
+      - field_id: 1001
+        name: "DCGM_FI_PROF_SM_ACTIVE"
+        description: "Fraction of time at least one warp is active on any SM (0.0-1.0). Broader measure than occupancy."
+        type: "gauge"
+        unit: "ratio"
+
+      # DRAM Activity (Profiling)
+      - field_id: 1005
+        name: "DCGM_FI_PROF_DRAM_ACTIVE"
+        description: "Fraction of cycles HBM memory interface is active (0.0-1.0). High values indicate memory-bound kernels."
+        type: "gauge"
+        unit: "ratio"
+
+      # FP16 Tensor Core Activity
+      - field_id: 1006
+        name: "DCGM_FI_PROF_PIPE_FP16_ACTIVE"
+        description: "Fraction of cycles FP16 pipelines are active. Relevant for mixed-precision inference."
+        type: "gauge"
+        unit: "ratio"
+
+      # PCIe Bandwidth (Profiling)
+      - field_id: 1009
+        name: "DCGM_FI_PROF_PCIE_TX_BYTES"
+        description: "PCIe TX bytes per second from profiling counters. More accurate than driver-level counters."
+        type: "gauge"
+        unit: "bytes/s"
+
+      - field_id: 1010
+        name: "DCGM_FI_PROF_PCIE_RX_BYTES"
+        description: "PCIe RX bytes per second from profiling counters. More accurate than driver-level counters."
+        type: "gauge"
+        unit: "bytes/s"
+
+      # NVLink Bandwidth (Profiling)
+      - field_id: 1011
+        name: "DCGM_FI_PROF_NVLINK_TX_BYTES"
+        description: "NVLink TX bytes per second from profiling counters. Used for TP communication monitoring."
+        type: "gauge"
+        unit: "bytes/s"
+
+      - field_id: 1012
+        name: "DCGM_FI_PROF_NVLINK_RX_BYTES"
+        description: "NVLink RX bytes per second from profiling counters. Used for TP communication monitoring."
+        type: "gauge"
+        unit: "bytes/s"
+
+# ==========================================================================
+# Prometheus Export Configuration
+# ==========================================================================
+prometheus:
+  # Metric relabeling rules for Prometheus compatibility
+  metric_relabeling:
+    # Add GPU model as a label
+    - source_labels: ["__name__"]
+      target_label: "gpu_model"
+      replacement: "${GPU_MODEL}"
+
+    # Add instance type for cloud cost correlation
+    - source_labels: ["__name__"]
+      target_label: "instance_type"
+      replacement: "${INSTANCE_TYPE}"
+
+  # Histogram buckets for latency-related profiling metrics
+  histogram_buckets:
+    default: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
+
+  # Scrape configuration hints for Prometheus
+  scrape_config:
+    scrape_interval: "10s"
+    scrape_timeout: "8s"
+    metrics_path: "/metrics"
+    honor_labels: true
+    scheme: "http"
+
+    # Kubernetes pod annotations for auto-discovery
+    kubernetes_annotations:
+      prometheus.io/scrape: "true"
+      prometheus.io/port: "9400"
+      prometheus.io/path: "/metrics"
+
+# ==========================================================================
+# Health Check Configuration
+# ==========================================================================
+health_check:
+  enabled: true
+  endpoint: "/health"
+  port: 9400
+
+  # GPU health validation checks
+  checks:
+    - name: "gpu_accessible"
+      description: "Verify all expected GPUs are accessible via DCGM"
+      expected_gpu_count: 4  # TP=4 configuration
+
+    - name: "driver_healthy"
+      description: "Verify NVIDIA driver is loaded and responding"
+      timeout_seconds: 5
+
+    - name: "ecc_mode"
+      description: "Verify ECC memory is enabled on all GPUs"
+      expected_state: "enabled"
+
+    - name: "persistence_mode"
+      description: "Verify GPU persistence mode is enabled for consistent metrics"
+      expected_state: "enabled"
+
+# ==========================================================================
+# Logging Configuration
+# ==========================================================================
+logging:
+  level: "info"  # debug, info, warn, error
+  format: "json"
+  output: "stdout"
+
+  # Log metric collection statistics every N collection cycles
+  stats_log_interval: 60
+
+  # Log slow metric collections exceeding this threshold
+  slow_collection_threshold_ms: 500

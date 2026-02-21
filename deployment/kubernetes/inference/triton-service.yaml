@@ -1,0 +1,40 @@
+# =============================================================================
+# Netflix Real-Time LLM Platform - Triton Inference Server Service
+# =============================================================================
+# ClusterIP Service exposing Triton gRPC, HTTP, and metrics endpoints.
+# Internal-only; the FastAPI gateway routes inference requests here.
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: triton-inference-server
+  namespace: netflix-llm
+  labels:
+    app.kubernetes.io/name: triton-inference-server
+    app.kubernetes.io/component: inference
+    app.kubernetes.io/part-of: netflix-llm-platform
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    app.kubernetes.io/description: "Triton Inference Server Service - gRPC, HTTP, and metrics"
+    team: "netflix-ml-platform"
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8003"
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: triton-inference-server
+    app.kubernetes.io/component: inference
+  ports:
+    - name: grpc
+      protocol: TCP
+      port: 8001
+      targetPort: grpc
+    - name: http
+      protocol: TCP
+      port: 8002
+      targetPort: http
+    - name: metrics
+      protocol: TCP
+      port: 8003
+      targetPort: metrics
+  sessionAffinity: None

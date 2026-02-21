@@ -1,1 +1,2 @@
-# ECTP API Schemas Package - Author: Gopi Krishna Vajrala
+# Netflix LLM Personalization Platform - Schemas Package
+# Author: Gopi Krishna Vajrala

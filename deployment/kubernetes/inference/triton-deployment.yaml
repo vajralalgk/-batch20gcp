@@ -1,0 +1,204 @@
+# =============================================================================
+# Netflix Real-Time LLM Platform - Triton Inference Server Deployment
+# =============================================================================
+# NVIDIA Triton Inference Server with TensorRT-LLM support.
+# Configured for multi-GPU inference on dedicated GPU node pools.
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: triton-inference-server
+  namespace: netflix-llm
+  labels:
+    app.kubernetes.io/name: triton-inference-server
+    app.kubernetes.io/component: inference
+    app.kubernetes.io/part-of: netflix-llm-platform
+    app.kubernetes.io/managed-by: kustomize
+    app.kubernetes.io/version: "24.01"
+  annotations:
+    app.kubernetes.io/description: "NVIDIA Triton Inference Server for real-time LLM inference"
+    team: "netflix-ml-platform"
+    contact: "ml-platform@netflix.com"
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: triton-inference-server
+      app.kubernetes.io/component: inference
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: triton-inference-server
+        app.kubernetes.io/component: inference
+        app.kubernetes.io/part-of: netflix-llm-platform
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8003"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: triton-sa
+      terminationGracePeriodSeconds: 120
+
+      # Schedule only on GPU-enabled nodes with the appropriate taint.
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+        node.kubernetes.io/instance-type: "p4d.24xlarge"
+
+      # Tolerate GPU node taints so Triton pods are accepted on GPU nodes.
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: "dedicated"
+          operator: "Equal"
+          value: "gpu-inference"
+          effect: "NoSchedule"
+
+      # Spread replicas across availability zones for fault tolerance.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: triton-inference-server
+
+      # Pod-level security context.
+      securityContext:
+        runAsNonRoot: false
+        fsGroup: 1000
+
+      containers:
+        - name: triton-inference-server
+          image: nvcr.io/nvidia/tritonserver:24.01-trtllm-python-py3
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: grpc
+              containerPort: 8001
+              protocol: TCP
+            - name: http
+              containerPort: 8002
+              protocol: TCP
+            - name: metrics
+              containerPort: 8003
+              protocol: TCP
+
+          env:
+            # TensorRT-LLM engine configuration
+            - name: CUDA_VISIBLE_DEVICES
+              value: "0,1,2,3"
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility"
+            - name: LD_PRELOAD
+              value: "/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4"
+            # TensorRT-LLM specific settings
+            - name: TRTLLM_ENABLE_CHUNKED_CONTEXT
+              value: "1"
+            - name: TRTLLM_BATCH_SCHEDULER_POLICY
+              value: "max_utilization"
+            - name: TRTLLM_KV_CACHE_FREE_GPU_MEM_FRACTION
+              value: "0.85"
+            - name: TRTLLM_ENABLE_KV_CACHE_REUSE
+              value: "1"
+            - name: TRTLLM_MAX_BATCH_SIZE
+              value: "256"
+            - name: TRTLLM_MAX_NUM_SEQUENCES
+              value: "512"
+            # Model repository path
+            - name: MODEL_REPOSITORY
+              value: "/models"
+
+          # GPU and compute resource requests and limits.
+          resources:
+            requests:
+              cpu: "8"
+              memory: "64Gi"
+              nvidia.com/gpu: "4"
+            limits:
+              cpu: "16"
+              memory: "128Gi"
+              nvidia.com/gpu: "4"
+
+          # Liveness probe: restart the container if Triton becomes unresponsive.
+          livenessProbe:
+            httpGet:
+              path: /v2/health/live
+              port: http
+              scheme: HTTP
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+            successThreshold: 1
+
+          # Readiness probe: stop routing traffic if Triton is not ready.
+          readinessProbe:
+            httpGet:
+              path: /v2/health/ready
+              port: http
+              scheme: HTTP
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 3
+            successThreshold: 1
+
+          # Startup probe: allow up to 10 minutes for model loading.
+          startupProbe:
+            httpGet:
+              path: /v2/health/ready
+              port: http
+              scheme: HTTP
+            periodSeconds: 10
+            failureThreshold: 60
+            timeoutSeconds: 10
+
+          volumeMounts:
+            - name: model-repository
+              mountPath: /models
+              readOnly: true
+            - name: shm
+              mountPath: /dev/shm
+            - name: triton-cache
+              mountPath: /opt/tritonserver/caches
+
+          command: ["tritonserver"]
+          args:
+            - "--model-repository=/models"
+            - "--strict-model-config=false"
+            - "--log-verbose=1"
+            - "--allow-grpc=true"
+            - "--allow-http=true"
+            - "--allow-metrics=true"
+            - "--grpc-port=8001"
+            - "--http-port=8002"
+            - "--metrics-port=8003"
+            - "--response-cache-byte-size=1073741824"
+            - "--backend-config=python,shm-default-byte-size=4194304"
+            - "--model-control-mode=explicit"
+
+      volumes:
+        # Model repository backed by a PersistentVolumeClaim.
+        # In production this may be backed by an S3-CSI driver or EFS.
+        - name: model-repository
+          persistentVolumeClaim:
+            claimName: triton-model-repository-pvc
+        # Shared memory volume required by TensorRT-LLM for inter-process
+        # communication. Size must accommodate KV cache and batch buffers.
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "16Gi"
+        # Cache directory for compiled TensorRT engines.
+        - name: triton-cache
+          emptyDir:
+            sizeLimit: "20Gi"

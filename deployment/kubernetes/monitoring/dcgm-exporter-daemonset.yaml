@@ -1,0 +1,136 @@
+# =============================================================================
+# Netflix Real-Time LLM Platform - NVIDIA DCGM Exporter DaemonSet
+# =============================================================================
+# Runs one DCGM Exporter pod on every GPU-enabled node in the cluster.
+# Collects GPU telemetry (utilization, temperature, memory, power, ECC errors)
+# and exposes Prometheus-format metrics on port 9400.
+# =============================================================================
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dcgm-exporter
+  namespace: netflix-llm
+  labels:
+    app.kubernetes.io/name: dcgm-exporter
+    app.kubernetes.io/component: monitoring
+    app.kubernetes.io/part-of: netflix-llm-platform
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    app.kubernetes.io/description: "NVIDIA DCGM Exporter for GPU metrics collection"
+    team: "netflix-ml-platform"
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dcgm-exporter
+      app.kubernetes.io/component: monitoring
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: dcgm-exporter
+        app.kubernetes.io/component: monitoring
+        app.kubernetes.io/part-of: netflix-llm-platform
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9400"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: dcgm-exporter-sa
+
+      # Only schedule on nodes that have GPUs.
+      nodeSelector:
+        nvidia.com/gpu.present: "true"
+
+      # Tolerate GPU-dedicated node taints.
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: "dedicated"
+          operator: "Equal"
+          value: "gpu-inference"
+          effect: "NoSchedule"
+
+      # Priority: monitoring agents should run even under resource pressure.
+      priorityClassName: system-node-critical
+
+      containers:
+        - name: dcgm-exporter
+          image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.0-3.2.0-ubuntu22.04
+          imagePullPolicy: IfNotPresent
+
+          ports:
+            - name: metrics
+              containerPort: 9400
+              protocol: TCP
+              hostPort: 9400
+
+          env:
+            - name: DCGM_EXPORTER_LISTEN
+              value: ":9400"
+            - name: DCGM_EXPORTER_KUBERNETES
+              value: "true"
+            - name: DCGM_EXPORTER_COLLECTORS
+              value: "/etc/dcgm-exporter/dcp-metrics-included.csv"
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+              nvidia.com/gpu: "0"
+
+          # Liveness probe: check the metrics endpoint.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          # Readiness probe: ensure metrics are being served.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: metrics
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          securityContext:
+            runAsNonRoot: false
+            runAsUser: 0
+            privileged: true
+            capabilities:
+              add:
+                - SYS_ADMIN
+
+          volumeMounts:
+            - name: device-plugin
+              mountPath: /var/lib/kubelet/device-plugins
+              readOnly: true
+            - name: pod-resources
+              mountPath: /var/lib/kubelet/pod-resources
+              readOnly: true
+            - name: nvidia-install-dir
+              mountPath: /usr/local/nvidia
+              readOnly: true
+
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+        - name: pod-resources
+          hostPath:
+            path: /var/lib/kubelet/pod-resources
+        - name: nvidia-install-dir
+          hostPath:
+            path: /usr/local/nvidia

@@ -1,228 +1,89 @@
-<div align="center">
+# ADR-001: FastAPI as API Framework for LLM Inference Platform
 
-# ADR-001: FastAPI as API Framework
-
-![Status](https://img.shields.io/badge/Status-ACCEPTED-brightgreen?style=for-the-badge)
-![Category](https://img.shields.io/badge/Category-API_Framework-blue?style=for-the-badge)
-![Priority](https://img.shields.io/badge/Priority-Critical-red?style=for-the-badge)
-
-</div>
-
----
-
-```
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                                                                            ║
-║   DECISION SUMMARY                                                         ║
-║                                                                            ║
-║   Use FastAPI as the primary API framework for ECTP.                       ║
-║                                                                            ║
-║   FastAPI provides native async support, automatic OpenAPI documentation,  ║
-║   Pydantic-based type safety, and industry-leading performance at ~15k     ║
-║   requests per second -- making it the optimal choice for the ECTP REST    ║
-║   API layer.                                                               ║
-║                                                                            ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-```
-
----
-
-## Document Metadata
-
-| Field | Details |
-|:---|:---|
-| **ADR Number** | ADR-001 |
-| **Title** | FastAPI as API Framework |
-| **Author** | Gopi Krishna Vajrala |
-| **Date** | 2026-02-16 |
-| **Status** | ![ACCEPTED](https://img.shields.io/badge/ACCEPTED-brightgreen?style=flat-square) |
-| **Reviewers** | Platform Architecture Team |
-| **Category** | API Framework Selection |
-| **Supersedes** | N/A |
+**Status:** ACCEPTED
+**Date:** 2026-02-21
+**Author:** Gopi Krishna Vajrala
+**Deciders:** Platform Engineering Team
+**Category:** API Layer
 
 ---
 
 ## Context
 
-### Problem Statement
+The Netflix Real-Time LLM Personalization & Inference Platform requires a high-performance API layer that can handle 50,000+ requests per second globally with sub-100ms P99 latency. The API layer must support:
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                                                                          │
-│   ECTP needs a Python web framework for its REST API layer that          │
-│   supports async operations, automatic API documentation, and            │
-│   high performance.                                                      │
-│                                                                          │
-│   Key Requirements:                                                      │
-│   ├── Native asynchronous request handling                               │
-│   ├── Automatic OpenAPI/Swagger documentation generation                 │
-│   ├── High throughput for enterprise workloads                           │
-│   ├── Strong type safety and data validation                             │
-│   └── Manageable learning curve for the team                             │
-│                                                                          │
-└──────────────────────────────────────────────────────────────────────────┘
-```
+- Asynchronous request handling for non-blocking GPU inference calls
+- Server-Sent Events (SSE) for streaming token-by-token responses
+- High concurrency with minimal overhead per connection
+- Native support for gRPC communication with NVIDIA Triton Inference Server
+- Automatic API documentation for internal consumers
+- Pydantic-based request/response validation for type safety
+- Middleware support for authentication, rate limiting, and circuit breaking
 
----
+The API layer sits between client applications (Netflix apps, internal services) and the GPU inference backend (Triton). It must efficiently manage the latency budget: of the 100ms P99 budget, only 10ms is allocated to request parsing, routing, and response serialization.
 
 ## Decision
 
-> **We will use FastAPI as the API framework for ECTP.**
-
----
+We adopt **FastAPI** as the primary API framework for the LLM inference platform.
 
 ## Alternatives Considered
 
-### Comparison Matrix
+### Flask
 
-| Criteria | FastAPI | Flask | Django REST Framework |
-|:---|:---:|:---:|:---:|
-| **Async Support** | Native | Extension | Limited |
-| **Performance** | ~15k req/s | ~5k req/s | ~3k req/s |
-| **Auto OpenAPI** | Built-in | Manual | Extension |
-| **Type Safety** | Pydantic | Manual | Serializers |
-| **Learning Curve** | Low | Low | Medium |
+- **Pros:** Mature ecosystem, simple, well-understood by team
+- **Cons:** Synchronous by default (requires extensions for async), no native SSE support, no automatic OpenAPI generation, WSGI-based architecture limits concurrency
+- **Rejected because:** The synchronous request model would create thread contention under high concurrency. Each GPU inference call takes 30-60ms; blocking threads during this time would require hundreds of threads to maintain throughput, adding significant memory overhead and context-switching costs.
 
-### Detailed Evaluation
+### Django + Django REST Framework
 
-<table>
-<tr>
-<th width="33%">FastAPI</th>
-<th width="33%">Flask</th>
-<th width="33%">Django REST Framework</th>
-</tr>
-<tr>
-<td>
+- **Pros:** Batteries-included, ORM, admin interface, mature
+- **Cons:** Heavy framework overhead (15-20ms per request), synchronous by default (ASGI support is recent and less mature), ORM unnecessary for inference workload, significantly slower than FastAPI for I/O-bound workloads
+- **Rejected because:** Framework overhead alone would consume 15-20% of the latency budget. The ORM and admin features are unnecessary for an inference-focused API.
 
-```
-  ┌──────────────┐
-  │   FastAPI     │
-  │              │
-  │  Score: 9/10 │
-  │  ★★★★★★★★★☆ │
-  │              │
-  │  SELECTED    │
-  └──────────────┘
-```
+### gRPC-only (No REST)
 
-**Strengths:**
-- Native async/await
-- Auto OpenAPI docs
-- Pydantic validation
-- ~15k req/s throughput
-- Modern Python idioms
-
-**Weaknesses:**
-- Smaller ecosystem
-
-</td>
-<td>
-
-```
-  ┌──────────────┐
-  │    Flask      │
-  │              │
-  │  Score: 6/10 │
-  │  ★★★★★★☆☆☆☆ │
-  │              │
-  │  REJECTED    │
-  └──────────────┘
-```
-
-**Strengths:**
-- Mature ecosystem
-- Simple to learn
-- Flexible
-
-**Weaknesses:**
-- No native async
-- Manual API docs
-- Lower throughput
-- Manual validation
-
-</td>
-<td>
-
-```
-  ┌──────────────┐
-  │  Django REST  │
-  │              │
-  │  Score: 5/10 │
-  │  ★★★★★☆☆☆☆☆ │
-  │              │
-  │  REJECTED    │
-  └──────────────┘
-```
-
-**Strengths:**
-- Full ORM included
-- Admin interface
-- Large community
-
-**Weaknesses:**
-- Limited async
-- Heaviest framework
-- Lowest throughput
-- Steeper learning curve
-
-</td>
-</tr>
-</table>
-
-### Performance Comparison
-
-```
-  Requests per Second (higher is better)
-  ─────────────────────────────────────────────────────
-
-  FastAPI     ████████████████████████████████████  ~15,000 req/s
-  Flask       ████████████                          ~5,000  req/s
-  Django REST ████████                              ~3,000  req/s
-
-  ─────────────────────────────────────────────────────
-```
-
----
+- **Pros:** Lower serialization overhead (Protocol Buffers), native streaming, strongly typed contracts, excellent performance
+- **Cons:** Poor browser support (requires gRPC-Web proxy), debugging difficulty (binary protocol), limited tooling for non-gRPC clients, Netflix mobile apps use REST
+- **Rejected as sole solution because:** While we use gRPC internally (FastAPI to Triton), the external API must support REST for compatibility with Netflix client applications. FastAPI provides both REST and can proxy to gRPC backends.
 
 ## Consequences
 
-### Positive Outcomes
+### Positive
 
-| # | Outcome | Impact |
-|:---:|:---|:---|
-| &#9989; | **Superior performance** -- ~15k requests/second provides headroom for enterprise scale | High |
-| &#9989; | **Auto-documentation** -- OpenAPI/Swagger UI generated automatically from code | High |
-| &#9989; | **Native async** -- First-class async/await support for I/O-bound operations | High |
-| &#9989; | **Type safety** -- Pydantic models provide runtime validation and IDE support | Medium |
-| &#9989; | **Developer experience** -- Modern Python patterns reduce boilerplate | Medium |
+- **Native async/await:** FastAPI runs on uvicorn (ASGI), enabling true async I/O. GPU inference calls are non-blocking, allowing a single worker to handle hundreds of concurrent requests.
+- **SSE streaming support:** Native support for `StreamingResponse` enables token-by-token delivery without additional libraries.
+- **Automatic OpenAPI docs:** Swagger UI and ReDoc are generated automatically from Pydantic models, reducing documentation burden.
+- **Pydantic validation:** Request/response models are validated at the framework level with zero additional code, catching malformed requests before they reach the inference pipeline.
+- **Performance:** FastAPI benchmarks at 15,000+ requests/second per worker on CPU-bound tasks, and significantly higher for async I/O workloads.
+- **Type safety:** Python type hints provide IDE support, catch errors at development time, and generate accurate API contracts.
+- **Middleware ecosystem:** Built-in support for CORS, trusted hosts, GZip compression, and custom middleware for rate limiting and circuit breaking.
 
-### Negative Outcomes
+### Negative
 
-| # | Outcome | Mitigation |
-|:---:|:---|:---|
-| &#9888; | **Smaller ecosystem** than Flask/Django | Mitigated by rapidly growing community and compatible ASGI middleware |
+- **Python GIL:** CPU-bound operations (tokenization, response formatting) are limited by the GIL. Mitigated by offloading CPU-intensive work to separate processes and using uvloop for event loop optimization.
+- **Memory footprint:** Each uvicorn worker consumes ~200MB. With 8 workers per pod, this totals ~1.6GB per pod. Acceptable given the p4d.24xlarge instances have 1,152 GB RAM.
+- **Learning curve:** Team members familiar with Flask/Django need to learn async patterns and Pydantic models. Mitigated with internal training and code examples.
+
+### Performance Configuration
+
+```python
+# Production uvicorn configuration
+uvicorn_config = {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "workers": 8,               # Match CPU cores allocated to API pod
+    "loop": "uvloop",           # High-performance event loop
+    "http": "httptools",        # Fast HTTP parser
+    "limit_concurrency": 1000,  # Max concurrent connections per worker
+    "timeout_keep_alive": 30,   # Keep-alive timeout
+    "access_log": False,        # Disable for performance (use structured logging)
+}
+```
 
 ---
 
-## References
+**References:**
 
-| Resource | Link |
-|:---|:---|
-| FastAPI Official Documentation | [https://fastapi.tiangolo.com](https://fastapi.tiangolo.com) |
-| Pydantic Documentation | [https://docs.pydantic.dev](https://docs.pydantic.dev) |
-| ASGI Specification | [https://asgi.readthedocs.io](https://asgi.readthedocs.io) |
-| TechEmpower Benchmarks | [https://www.techempower.com/benchmarks](https://www.techempower.com/benchmarks) |
-
----
-
-<div align="center">
-
-**Author:** Gopi Krishna Vajrala
-
-![Status](https://img.shields.io/badge/Status-ACCEPTED-brightgreen?style=flat-square)
-&nbsp;&nbsp;|&nbsp;&nbsp;
-**ADR-001**
-&nbsp;&nbsp;|&nbsp;&nbsp;
-**2026-02-16**
-
-</div>
+- [FastAPI Documentation](https://fastapi.tiangolo.com/)
+- [Uvicorn ASGI Server](https://www.uvicorn.org/)
+- [NVIDIA Triton Client Libraries](https://github.com/triton-inference-server/client)

@@ -1,0 +1,369 @@
+# ============================================================================
+# Netflix Real-Time LLM Personalization & Inference Platform - SLA Definitions
+# Service Level Agreements, Objectives, and Error Budgets
+# ============================================================================
+# Defines SLA tiers, latency/throughput SLOs, availability windows,
+# error budget policies, and escalation procedures for the LLM platform.
+# ============================================================================
+
+# ==========================================================================
+# SLA Tiers
+# ==========================================================================
+# Each tier defines a different level of availability commitment.
+# Services are assigned to tiers based on their criticality to the
+# Netflix streaming experience and real-time personalization pipeline.
+# ==========================================================================
+
+sla_tiers:
+  platinum:
+    name: "Platinum"
+    description: >-
+      Highest availability tier for real-time personalization inference
+      endpoints that directly serve Netflix member experiences. Any
+      degradation is immediately visible to members as poor recommendations
+      or increased page load times.
+    availability_target: 99.99  # percent (52.6 minutes downtime/year)
+    services:
+      - "Real-Time Inference API"
+      - "Homepage Personalization Endpoint"
+      - "Search Ranking Inference"
+      - "Play-Next Recommendation Engine"
+    allowed_downtime:
+      yearly: "52m 35s"
+      monthly: "4m 23s"
+      weekly: "1m 0s"
+    response_time:
+      P1_critical: "5 minutes"
+      P2_high: "15 minutes"
+      P3_moderate: "1 hour"
+
+  gold:
+    name: "Gold"
+    description: >-
+      High availability tier for supporting inference services that impact
+      member experience indirectly. Brief disruptions may cause slightly
+      degraded personalization but the platform falls back to cached or
+      default recommendations.
+    availability_target: 99.95  # percent (4.38 hours downtime/year)
+    services:
+      - "Batch Inference Pipeline"
+      - "A/B Test Inference Variant Server"
+      - "Model Canary Deployment Endpoint"
+      - "Feature Store Serving Layer"
+    allowed_downtime:
+      yearly: "4h 22m 48s"
+      monthly: "21m 54s"
+      weekly: "5m 2s"
+    response_time:
+      P1_critical: "15 minutes"
+      P2_high: "30 minutes"
+      P3_moderate: "4 hours"
+
+  silver:
+    name: "Silver"
+    description: >-
+      Standard availability tier for internal tooling, analytics, and
+      non-member-facing inference services. Downtime impacts internal
+      workflows but not the live member experience.
+    availability_target: 99.9  # percent (8.76 hours downtime/year)
+    services:
+      - "Model Training Pipeline"
+      - "Inference Analytics Dashboard"
+      - "Cost Reporting API"
+      - "Model Registry & Versioning"
+      - "Offline Evaluation Service"
+    allowed_downtime:
+      yearly: "8h 45m 36s"
+      monthly: "43m 48s"
+      weekly: "10m 5s"
+    response_time:
+      P1_critical: "30 minutes"
+      P2_high: "2 hours"
+      P3_moderate: "24 hours"
+
+# ==========================================================================
+# Latency SLOs
+# ==========================================================================
+# Latency objectives for inference requests measured at the API gateway
+# edge, including network overhead. These are measured using histogram
+# quantiles over rolling windows.
+# ==========================================================================
+
+latency_slos:
+  p95:
+    target_ms: 200
+    description: >-
+      95th percentile of inference latency must remain below 200ms.
+      This ensures that the vast majority of personalization requests
+      complete fast enough for real-time page rendering.
+    measurement_window: "5m"
+    metric: "histogram_quantile(0.95, sum(rate(netflix_llm_inference_latency_seconds_bucket[5m])) by (le)) * 1000"
+    breach_threshold: 200
+    alert_name: "HighP95Latency"
+
+  p99:
+    target_ms: 250
+    description: >-
+      99th percentile of inference latency must remain below 250ms.
+      This constrains tail latency to prevent outlier requests from
+      degrading the user experience or causing cascading timeouts
+      in upstream microservices.
+    measurement_window: "5m"
+    metric: "histogram_quantile(0.99, sum(rate(netflix_llm_inference_latency_seconds_bucket[5m])) by (le)) * 1000"
+    breach_threshold: 250
+    alert_name: "HighP99Latency"
+
+  time_to_first_token:
+    target_ms: 100
+    description: >-
+      Time from request receipt to the first generated token. Critical
+      for streaming inference responses where the client begins
+      processing partial results incrementally.
+    measurement_window: "5m"
+    metric: "histogram_quantile(0.95, sum(rate(netflix_llm_ttft_seconds_bucket[5m])) by (le)) * 1000"
+    breach_threshold: 100
+
+# ==========================================================================
+# Throughput SLOs
+# ==========================================================================
+# Minimum throughput guarantees per region to ensure the platform can
+# serve the expected request volume for real-time personalization.
+# ==========================================================================
+
+throughput_slos:
+  tokens_per_second:
+    minimum_per_region: 3000
+    description: >-
+      Each region must sustain at least 3000 tokens per second of
+      aggregate inference throughput. This is the minimum required to
+      serve peak personalization traffic without queuing delays. The
+      value accounts for both prefill and decode phases combined.
+    metric: "sum(rate(netflix_llm_tokens_generated_total[1m])) by (region)"
+    breach_threshold: 3000
+    measurement_window: "1m"
+
+  requests_per_second:
+    minimum_per_region: 500
+    description: >-
+      Each region must handle at least 500 inference requests per
+      second at peak. This is derived from expected member activity
+      patterns with headroom for traffic spikes.
+    metric: "sum(rate(netflix_llm_inference_requests_total[1m])) by (region)"
+    breach_threshold: 500
+    measurement_window: "1m"
+
+# ==========================================================================
+# Availability Windows
+# ==========================================================================
+# Defines when SLA measurements apply and scheduled maintenance windows.
+# ==========================================================================
+
+availability_windows:
+  platinum_tier:
+    measurement: "24/7/365"
+    description: >-
+      Platinum tier services are measured continuously with no exclusion
+      windows. All downtime counts against the availability target.
+    maintenance_exclusion: false
+    scheduled_maintenance:
+      allowed: false
+      description: "No scheduled maintenance windows for platinum tier. All changes must be zero-downtime."
+
+  gold_tier:
+    measurement: "24/7/365"
+    description: >-
+      Gold tier services are measured continuously, but pre-approved
+      scheduled maintenance windows are excluded from SLA calculations.
+    maintenance_exclusion: true
+    scheduled_maintenance:
+      allowed: true
+      window: "Tuesday 02:00-04:00 UTC"
+      frequency: "bi-weekly"
+      notification_hours_before: 72
+      max_duration_minutes: 120
+      approval_required: true
+      approver: "LLM Platform Engineering Lead"
+
+  silver_tier:
+    measurement: "24/7/365"
+    description: >-
+      Silver tier services are measured continuously with scheduled
+      maintenance windows excluded from SLA calculations.
+    maintenance_exclusion: true
+    scheduled_maintenance:
+      allowed: true
+      window: "Sunday 02:00-06:00 UTC"
+      frequency: "weekly"
+      notification_hours_before: 48
+      max_duration_minutes: 240
+      approval_required: false
+
+# ==========================================================================
+# Error Budgets
+# ==========================================================================
+# Error budget policies govern how much unreliability is tolerable within
+# a given period. When the error budget is exhausted, reliability work
+# takes priority over feature development.
+# ==========================================================================
+
+error_budgets:
+  calculation_method: >-
+    Error budget = (1 - availability_target) * total_minutes_in_period.
+    Budget consumption is tracked as the ratio of actual downtime to
+    allowed downtime.
+
+  policies:
+    platinum:
+      monthly_budget_minutes: 4.38
+      burn_rate_alert_thresholds:
+        - name: "fast_burn"
+          consumption_rate: "14.4x"  # exhausts budget in 2 days
+          window: "1h"
+          severity: "critical"
+          action: "Page on-call, halt all non-critical deployments"
+        - name: "slow_burn"
+          consumption_rate: "6x"  # exhausts budget in 5 days
+          window: "6h"
+          severity: "warning"
+          action: "Notify team, review recent changes"
+      budget_exhausted_policy: >-
+        When the monthly error budget is fully consumed, all feature
+        deployments are frozen. Only reliability improvements and
+        rollbacks are permitted until the budget resets at the start
+        of the next month.
+
+    gold:
+      monthly_budget_minutes: 21.9
+      burn_rate_alert_thresholds:
+        - name: "fast_burn"
+          consumption_rate: "14.4x"
+          window: "1h"
+          severity: "critical"
+          action: "Page on-call"
+        - name: "slow_burn"
+          consumption_rate: "6x"
+          window: "6h"
+          severity: "warning"
+          action: "Notify team"
+      budget_exhausted_policy: >-
+        When the monthly error budget is fully consumed, new feature
+        deployments require explicit approval from the Engineering Lead.
+        Reliability improvements are prioritized.
+
+    silver:
+      monthly_budget_minutes: 43.8
+      burn_rate_alert_thresholds:
+        - name: "fast_burn"
+          consumption_rate: "14.4x"
+          window: "1h"
+          severity: "warning"
+          action: "Notify team"
+        - name: "slow_burn"
+          consumption_rate: "6x"
+          window: "6h"
+          severity: "info"
+          action: "Track in weekly review"
+      budget_exhausted_policy: >-
+        When the monthly error budget is fully consumed, deployments
+        continue but with enhanced monitoring and mandatory rollback
+        plans for each change.
+
+# ==========================================================================
+# Escalation Policies
+# ==========================================================================
+# Defines escalation chains for different severity levels and SLA tiers.
+# ==========================================================================
+
+escalation_policies:
+  P1_critical:
+    description: "Service outage or severe degradation affecting members"
+    initial_response: "5 minutes"
+    escalation_chain:
+      - time: "0 minutes"
+        notify:
+          - "LLM Platform On-Call Engineer (PagerDuty)"
+          - "Slack: #llm-platform-incidents"
+      - time: "15 minutes"
+        notify:
+          - "LLM Platform Engineering Lead"
+          - "Streaming Infrastructure Manager"
+      - time: "30 minutes"
+        notify:
+          - "VP of Personalization Engineering"
+          - "Incident Commander rotation"
+      - time: "60 minutes"
+        notify:
+          - "SVP of Engineering"
+    communication:
+      internal_update_frequency: "every 15 minutes"
+      status_page_update: true
+      post_incident_review: "mandatory within 48 hours"
+
+  P2_high:
+    description: "Significant degradation not yet impacting SLA"
+    initial_response: "15 minutes"
+    escalation_chain:
+      - time: "0 minutes"
+        notify:
+          - "LLM Platform On-Call Engineer (PagerDuty)"
+          - "Slack: #llm-platform-alerts"
+      - time: "30 minutes"
+        notify:
+          - "LLM Platform Engineering Lead"
+      - time: "2 hours"
+        notify:
+          - "Streaming Infrastructure Manager"
+    communication:
+      internal_update_frequency: "every 30 minutes"
+      status_page_update: false
+      post_incident_review: "mandatory within 1 week"
+
+  P3_moderate:
+    description: "Minor degradation or non-urgent issue"
+    initial_response: "1 hour"
+    escalation_chain:
+      - time: "0 minutes"
+        notify:
+          - "Slack: #llm-platform-alerts"
+      - time: "4 hours"
+        notify:
+          - "LLM Platform Engineering Lead"
+    communication:
+      internal_update_frequency: "every 2 hours"
+      status_page_update: false
+      post_incident_review: "optional, tracked in weekly review"
+
+  P4_informational:
+    description: "Informational alerts, no action required"
+    initial_response: "next business day"
+    escalation_chain:
+      - time: "0 minutes"
+        notify:
+          - "Slack: #llm-platform-info"
+    communication:
+      internal_update_frequency: "none"
+      status_page_update: false
+      post_incident_review: "none"
+
+# ==========================================================================
+# SLA Reporting
+# ==========================================================================
+reporting:
+  frequency: "monthly"
+  recipients:
+    - "VP of Personalization Engineering"
+    - "LLM Platform Engineering Lead"
+    - "Streaming Infrastructure Manager"
+    - "FinOps Team Lead"
+  metrics_included:
+    - "Availability percentage by tier"
+    - "p95 and p99 latency trends"
+    - "Tokens per second throughput"
+    - "Error budget consumption"
+    - "Incident count by severity"
+    - "Mean Time to Detection (MTTD)"
+    - "Mean Time to Recovery (MTTR)"
+    - "SLA breach count and duration"
+    - "Cost per 1k tokens trend"
+    - "GPU efficiency score"
+  dashboard_url: "https://grafana.netflix.internal/d/netflix-llm-sla-report"

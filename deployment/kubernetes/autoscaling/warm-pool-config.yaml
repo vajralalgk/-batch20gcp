@@ -1,0 +1,121 @@
+# =============================================================================
+# Netflix Real-Time LLM Platform - Warm Pool Configuration
+# =============================================================================
+# ConfigMap defining warm pool settings for pre-warmed inference containers.
+# Warm pools eliminate cold-start latency by keeping containers ready with
+# models pre-loaded in GPU memory.
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: warm-pool-config
+  namespace: netflix-llm
+  labels:
+    app.kubernetes.io/name: warm-pool-config
+    app.kubernetes.io/component: autoscaling
+    app.kubernetes.io/part-of: netflix-llm-platform
+    app.kubernetes.io/managed-by: kustomize
+  annotations:
+    app.kubernetes.io/description: "Warm pool configuration for pre-warmed GPU inference containers"
+    team: "netflix-ml-platform"
+data:
+  # -------------------------------------------------------------------------
+  # Warm Pool General Settings
+  # -------------------------------------------------------------------------
+  # Number of pre-warmed containers to keep ready at all times.
+  # These containers have models loaded in GPU memory and are ready to serve.
+  warm-pool-size: "4"
+
+  # Minimum number of idle containers to maintain in the warm pool.
+  # If idle count drops below this, new containers are pre-warmed.
+  min-idle-containers: "2"
+
+  # Maximum number of pre-warmed containers (cost guard).
+  max-warm-containers: "8"
+
+  # Time (seconds) a warm container can sit idle before being reclaimed.
+  idle-timeout-seconds: "900"
+
+  # Interval (seconds) between warm pool health evaluations.
+  health-check-interval-seconds: "30"
+
+  # -------------------------------------------------------------------------
+  # Model Pre-load Configuration
+  # -------------------------------------------------------------------------
+  model-preload-config.yaml: |
+    # Models to pre-load into GPU memory when a warm container starts.
+    # Listed in priority order; higher-priority models are loaded first.
+    models:
+      - name: "personalization-llm-v3"
+        version: "1"
+        priority: 1
+        gpu_memory_fraction: 0.40
+        preload: true
+        warmup_requests: 5
+        warmup_input_shape:
+          input_ids: [1, 512]
+          attention_mask: [1, 512]
+
+      - name: "content-ranking-ensemble"
+        version: "1"
+        priority: 2
+        gpu_memory_fraction: 0.25
+        preload: true
+        warmup_requests: 10
+        warmup_input_shape:
+          user_features: [1, 128]
+          item_features: [1, 64]
+
+      - name: "embedding-model-v2"
+        version: "1"
+        priority: 3
+        gpu_memory_fraction: 0.15
+        preload: true
+        warmup_requests: 20
+        warmup_input_shape:
+          input_text: [1, 256]
+
+      - name: "real-time-reranker"
+        version: "1"
+        priority: 4
+        gpu_memory_fraction: 0.10
+        preload: false
+        warmup_requests: 5
+
+    # GPU memory reservation for KV cache and dynamic batching overhead.
+    reserved_gpu_memory_fraction: 0.10
+
+  # -------------------------------------------------------------------------
+  # Warm Pool Scaling Policy
+  # -------------------------------------------------------------------------
+  scaling-policy.yaml: |
+    # When to grow the warm pool.
+    scale_up:
+      # Grow when active/total ratio exceeds this threshold.
+      utilization_threshold: 0.75
+      # Number of containers to add per scale-up event.
+      increment: 2
+      # Minimum seconds between scale-up events.
+      cooldown_seconds: 120
+
+    # When to shrink the warm pool.
+    scale_down:
+      # Shrink when active/total ratio drops below this threshold.
+      utilization_threshold: 0.25
+      # Number of containers to remove per scale-down event.
+      decrement: 1
+      # Minimum seconds between scale-down events.
+      cooldown_seconds: 300
+
+    # Time-of-day schedule overrides (UTC).
+    scheduled_overrides:
+      # Peak hours: larger warm pool.
+      - start: "14:00"
+        end: "02:00"
+        warm_pool_size: 6
+        min_idle: 3
+      # Off-peak hours: smaller warm pool to save cost.
+      - start: "02:00"
+        end: "14:00"
+        warm_pool_size: 2
+        min_idle: 1

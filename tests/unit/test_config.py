@@ -1,443 +1,149 @@
-"""
-============================================================================
-Enterprise Cloud Transformation Platform (ECTP)
-Unit Tests for Core Configuration (settings.py)
-Author: Gopi Krishna Vajrala
-============================================================================
-
-Tests cover:
-    - Default values for all settings fields
-    - Environment variable loading via ECTP_ prefix
-    - Validation of log_level and env fields
-    - Database URL construction (async PostgreSQL)
-    - Redis URL construction (with and without password)
-    - CORS origins parsing from comma-separated string
-    - Production detection property
-    - Singleton behavior via get_settings()
-============================================================================
-"""
+"""Tests for src.core.config.settings -- Netflix LLM Platform configuration."""
 
 import os
+from unittest.mock import patch
+
 import pytest
 
-from src.core.config.settings import Settings, get_settings
+from src.core.config.settings import (
+    AppSettings,
+    GPUSettings,
+    ModelSettings,
+    MultiRegionSettings,
+    ObservabilitySettings,
+    RedisSettings,
+    SecuritySettings,
+    Settings,
+    TritonSettings,
+    get_settings,
+)
 
 
-class TestDefaultValues:
-    """Tests that all settings have correct default values."""
+class TestDefaultSettings:
+    """Verify that every settings group ships with sensible defaults."""
 
-    def test_default_app_name(self):
-        """App name defaults to 'ECTP'."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.app_name == "ECTP"
+    def test_default_settings(self):
+        settings = Settings()
+        assert settings.app.name == "netflix-llm-platform"
+        assert settings.app.version == "1.0.0"
+        assert settings.app.host == "0.0.0.0"
+        assert settings.app.port == 8000
+        assert settings.triton.model_name == "ensemble_llm"
+        assert settings.model.max_sequence_length == 4096
+        assert settings.rate_limit.enabled is True
 
-    def test_default_app_version(self):
-        """App version defaults to '1.0.0'."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.app_version == "1.0.0"
+    def test_gpu_settings(self):
+        gpu = GPUSettings()
+        assert isinstance(gpu.enable_gpu, bool)
+        assert gpu.max_batch_size >= 1
+        assert gpu.tensor_parallel_size >= 1
+        assert 0.1 <= gpu.memory_fraction <= 1.0
+        assert isinstance(gpu.dynamic_batching, bool)
+        assert isinstance(gpu.device_ids, list)
 
-    def test_default_env(self):
-        """Environment defaults to 'development'."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.env == "development"
+    def test_redis_settings(self):
+        redis = RedisSettings()
+        assert "redis" in redis.url.lower() or "localhost" in redis.url
+        assert redis.max_connections >= 1
+        assert redis.session_ttl_seconds >= 0
+        assert isinstance(redis.cluster_enabled, bool)
 
-    def test_default_debug_is_false(self):
-        """Debug is False by default for security."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.debug is False
+    def test_multi_region_settings(self):
+        region = MultiRegionSettings()
+        assert region.primary_region == "us-east-1"
+        assert isinstance(region.secondary_regions, list)
+        assert len(region.secondary_regions) >= 1
+        assert region.failover_timeout_seconds > 0
+        assert region.health_check_interval_seconds > 0
 
-    def test_default_log_level(self):
-        """Log level defaults to 'INFO'."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.log_level == "INFO"
+    def test_triton_settings_defaults(self):
+        triton = TritonSettings()
+        assert triton.server_url == "localhost:8001"
+        assert triton.model_version == "1"
+        assert triton.max_queue_delay_ms >= 0
 
-    def test_default_host(self):
-        """Host defaults to '0.0.0.0'."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.host == "0.0.0.0"
-
-    def test_default_port(self):
-        """Port defaults to 8000."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.port == 8000
-
-    def test_default_db_port(self):
-        """Database port defaults to 5432."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.db_port == 5432
-
-    def test_default_db_name(self):
-        """Database name defaults to 'ectp'."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.db_name == "ectp"
-
-    def test_default_db_pool_size(self):
-        """Connection pool size defaults to 10."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.db_pool_size == 10
-
-    def test_default_db_max_overflow(self):
-        """Max overflow defaults to 20."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.db_max_overflow == 20
-
-    def test_default_redis_host(self):
-        """Redis host defaults to 'localhost'."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.redis_host == "localhost"
-
-    def test_default_redis_port(self):
-        """Redis port defaults to 6379."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.redis_port == 6379
-
-    def test_default_redis_db(self):
-        """Redis database defaults to 0."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.redis_db == 0
-
-    def test_default_aws_region(self):
-        """AWS region defaults to 'us-east-1'."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.aws_region == "us-east-1"
-
-    def test_default_jwt_algorithm(self):
-        """JWT algorithm defaults to 'HS256'."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.jwt_algorithm == "HS256"
-
-    def test_default_jwt_expire_minutes(self):
-        """JWT token expiry defaults to 30 minutes."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.jwt_access_token_expire_minutes == 30
-
-    def test_default_cors_origins(self):
-        """CORS origins defaults to 'http://localhost:3000'."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.cors_origins == "http://localhost:3000"
+    def test_observability_settings_defaults(self):
+        obs = ObservabilitySettings()
+        assert isinstance(obs.prometheus_enabled, bool)
+        assert isinstance(obs.dcgm_enabled, bool)
+        assert isinstance(obs.otel_enabled, bool)
+        assert 0.0 <= obs.otel_sample_rate <= 1.0
 
 
-class TestEnvironmentVariableLoading:
-    """Tests that settings load correctly from constructor (simulating env vars)."""
+class TestSettingsFromEnv:
+    """Verify that environment variables are picked up correctly."""
 
-    def test_custom_app_name(self):
-        settings = Settings(
-            app_name="Custom-ECTP",
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.app_name == "Custom-ECTP"
+    def test_settings_from_env(self):
+        with patch.dict(os.environ, {"APP_NAME": "test-app", "APP_ENVIRONMENT": "staging"}):
+            app = AppSettings()
+            assert app.name == "test-app"
+            assert app.environment == "staging"
 
-    def test_custom_port(self):
-        settings = Settings(
-            port=9000,
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.port == 9000
+    def test_gpu_env_override(self):
+        with patch.dict(os.environ, {"GPU_ENABLE_GPU": "false", "GPU_MAX_BATCH_SIZE": "128"}):
+            gpu = GPUSettings()
+            assert gpu.enable_gpu is False
+            assert gpu.max_batch_size == 128
 
-    def test_custom_db_settings(self):
-        settings = Settings(
-            db_host="prod-db.example.com",
-            db_port=5433,
-            db_name="ectp_prod",
-            db_user="prod_user",
-            db_password="prod_password",
-            jwt_secret_key="key",
-        )
-        assert settings.db_host == "prod-db.example.com"
-        assert settings.db_port == 5433
-        assert settings.db_name == "ectp_prod"
-        assert settings.db_user == "prod_user"
-        assert settings.db_password == "prod_password"
+    def test_security_env_override(self):
+        with patch.dict(os.environ, {"SECURITY_JWT_SECRET_KEY": "super-secret"}):
+            sec = SecuritySettings()
+            assert sec.jwt_secret_key == "super-secret"
 
-    def test_debug_enabled(self):
-        settings = Settings(
-            debug=True,
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.debug is True
+    def test_triton_env_override(self):
+        with patch.dict(os.environ, {"TRITON_SERVER_URL": "triton:9001"}):
+            triton = TritonSettings()
+            assert triton.server_url == "triton:9001"
 
 
-class TestValidation:
-    """Tests for settings field validation."""
+class TestSettingsValidation:
+    """Ensure validators reject invalid values."""
 
-    def test_valid_log_levels(self):
-        """All standard Python log levels are accepted."""
-        for level in ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]:
-            settings = Settings(
-                log_level=level,
-                db_host="localhost", db_user="test",
-                db_password="test", jwt_secret_key="key",
-            )
-            assert settings.log_level == level
-
-    def test_log_level_case_insensitive(self):
-        """Log level validation is case-insensitive."""
-        settings = Settings(
-            log_level="debug",
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.log_level == "DEBUG"
-
-    def test_invalid_log_level_raises_error(self):
-        """Invalid log level raises a validation error."""
+    def test_invalid_environment(self):
         with pytest.raises(Exception):
-            Settings(
-                log_level="INVALID",
-                db_host="localhost", db_user="test",
-                db_password="test", jwt_secret_key="key",
-            )
+            AppSettings(environment="invalid-env")
+
+    def test_invalid_quantization(self):
+        with pytest.raises(Exception):
+            ModelSettings(quantization="bfloat16")
+
+    def test_valid_quantization_values(self):
+        for q in ("awq", "gptq", "fp8"):
+            m = ModelSettings(quantization=q)
+            assert m.quantization == q
+
+    def test_none_quantization_is_valid(self):
+        m = ModelSettings(quantization=None)
+        assert m.quantization is None
+
+    def test_gpu_memory_fraction_bounds(self):
+        with pytest.raises(Exception):
+            GPUSettings(memory_fraction=0.0)
+        with pytest.raises(Exception):
+            GPUSettings(memory_fraction=1.5)
 
     def test_valid_environments(self):
-        """All four deployment environments are accepted."""
-        for env in ["development", "qa", "uat", "production"]:
-            settings = Settings(
-                env=env,
-                db_host="localhost", db_user="test",
-                db_password="test", jwt_secret_key="key",
-            )
-            assert settings.env == env
-
-    def test_env_case_insensitive(self):
-        """Environment validation is case-insensitive."""
-        settings = Settings(
-            env="PRODUCTION",
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.env == "production"
-
-    def test_invalid_env_raises_error(self):
-        """Invalid environment name raises a validation error."""
-        with pytest.raises(Exception):
-            Settings(
-                env="staging",
-                db_host="localhost", db_user="test",
-                db_password="test", jwt_secret_key="key",
-            )
+        for env in ("development", "staging", "production"):
+            app = AppSettings(environment=env)
+            assert app.environment == env
 
 
-class TestDatabaseUrlConstruction:
-    """Tests for the database_url property."""
+class TestSettingsSingleton:
+    """Test the cached get_settings() factory."""
 
-    def test_database_url_format(self):
-        """Database URL follows asyncpg format."""
-        settings = Settings(
-            db_host="myhost", db_port=5432, db_name="mydb",
-            db_user="myuser", db_password="mypass",
-            jwt_secret_key="key",
-        )
-        assert settings.database_url == "postgresql+asyncpg://myuser:mypass@myhost:5432/mydb"
+    def test_get_settings_singleton(self):
+        get_settings.cache_clear()
+        s1 = get_settings()
+        s2 = get_settings()
+        assert s1 is s2
+        get_settings.cache_clear()
 
-    def test_database_url_contains_asyncpg_driver(self):
-        """Database URL uses the asyncpg driver."""
-        settings = Settings(
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert "asyncpg" in settings.database_url
+    def test_is_production_property(self):
+        with patch.dict(os.environ, {"APP_ENVIRONMENT": "production"}):
+            s = Settings()
+            assert s.is_production is True
 
-    def test_database_url_custom_port(self):
-        """Database URL uses custom port when specified."""
-        settings = Settings(
-            db_host="localhost", db_port=5433,
-            db_user="test", db_password="test",
-            jwt_secret_key="key",
-        )
-        assert ":5433/" in settings.database_url
-
-    def test_database_url_includes_all_components(self):
-        """Database URL includes host, port, user, password, and database name."""
-        settings = Settings(
-            db_host="dbhost", db_port=5432, db_name="testdb",
-            db_user="testuser", db_password="testpass",
-            jwt_secret_key="key",
-        )
-        url = settings.database_url
-        assert "testuser" in url
-        assert "testpass" in url
-        assert "dbhost" in url
-        assert "5432" in url
-        assert "testdb" in url
-
-
-class TestRedisUrlConstruction:
-    """Tests for the redis_url property."""
-
-    def test_redis_url_without_password(self):
-        """Redis URL omits password for local development."""
-        settings = Settings(
-            redis_host="localhost", redis_port=6379,
-            redis_db=0, redis_password="",
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.redis_url == "redis://localhost:6379/0"
-
-    def test_redis_url_with_password(self):
-        """Redis URL includes password when set."""
-        settings = Settings(
-            redis_host="cache.example.com", redis_port=6379,
-            redis_db=0, redis_password="redis_secret",
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.redis_url == "redis://:redis_secret@cache.example.com:6379/0"
-
-    def test_redis_url_custom_db(self):
-        """Redis URL uses custom database number."""
-        settings = Settings(
-            redis_host="localhost", redis_port=6379,
-            redis_db=5, redis_password="",
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.redis_url.endswith("/5")
-
-    def test_redis_url_custom_port(self):
-        """Redis URL uses custom port."""
-        settings = Settings(
-            redis_host="localhost", redis_port=6380,
-            redis_db=0, redis_password="",
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert ":6380/" in settings.redis_url
-
-
-class TestCorsOriginsParsing:
-    """Tests for the cors_origins_list property."""
-
-    def test_single_origin(self):
-        """Single CORS origin parsed correctly."""
-        settings = Settings(
-            cors_origins="http://localhost:3000",
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.cors_origins_list == ["http://localhost:3000"]
-
-    def test_multiple_origins(self):
-        """Multiple comma-separated origins parsed correctly."""
-        settings = Settings(
-            cors_origins="http://localhost:3000,https://portal.example.edu,https://admin.example.edu",
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        origins = settings.cors_origins_list
-        assert len(origins) == 3
-        assert "http://localhost:3000" in origins
-        assert "https://portal.example.edu" in origins
-        assert "https://admin.example.edu" in origins
-
-    def test_origins_with_spaces_stripped(self):
-        """Whitespace around origins is stripped."""
-        settings = Settings(
-            cors_origins="http://localhost:3000 , http://localhost:8080 ",
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        origins = settings.cors_origins_list
-        assert "http://localhost:3000" in origins
-        assert "http://localhost:8080" in origins
-
-
-class TestProductionDetection:
-    """Tests for the is_production property."""
-
-    def test_production_detected(self):
-        settings = Settings(
-            env="production",
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.is_production is True
-
-    def test_development_not_production(self):
-        settings = Settings(
-            env="development",
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.is_production is False
-
-    def test_qa_not_production(self):
-        settings = Settings(
-            env="qa",
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.is_production is False
-
-    def test_uat_not_production(self):
-        settings = Settings(
-            env="uat",
-            db_host="localhost", db_user="test",
-            db_password="test", jwt_secret_key="key",
-        )
-        assert settings.is_production is False
-
-
-class TestSettingsConfig:
-    """Tests for Pydantic settings configuration."""
-
-    def test_env_prefix(self):
-        """Settings use ECTP_ prefix for environment variables."""
-        assert hasattr(Settings, 'Config') and Settings.Config.env_prefix == "ECTP_"
+    def test_is_not_production(self):
+        with patch.dict(os.environ, {"APP_ENVIRONMENT": "development"}):
+            s = Settings()
+            assert s.is_production is False
