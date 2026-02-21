@@ -881,6 +881,343 @@ def create_document():
         subsection(doc, title, ACCENT_BLUE)
         body(doc, skills)
 
+    doc.add_page_break()
+
+    # ── 18. IDEMPOTENCY & REQUEST SAFETY ──
+    section_header(doc, "18. IDEMPOTENCY & REQUEST SAFETY")
+    body(doc,
+        "Every GPU inference request is guaranteed exactly-once execution through a comprehensive "
+        "idempotency framework. Clients attach an Idempotency-Key header to each request, and the "
+        "platform enforces duplicate suppression via request fingerprinting and a deterministic "
+        "state machine.")
+
+    subsection(doc, "Idempotency Architecture")
+    styled_table(doc,
+        ["Component", "Configuration", "Purpose"],
+        [
+            ["Idempotency-Key Header", "UUID v4, required on mutating calls", "Unique request identifier for dedup"],
+            ["Request Fingerprint", "SHA-256(key + endpoint + body hash)", "Canonical request identity regardless of retries"],
+            ["State Machine", "PENDING -> COMPLETED | FAILED", "Tracks execution lifecycle per idempotency key"],
+            ["TTL Window", "24 hours (configurable)", "Keys expire after TTL; safe to reuse after expiry"],
+            ["Storage Backend", "Redis cluster with cross-region replication", "Low-latency lookup for duplicate detection"],
+        ], widths=[1.8, 2.2, 2.2])
+
+    subsection(doc, "Exactly-Once GPU Execution")
+    for pf, tx in [
+        ("Duplicate Suppression: ", "If a key is already PENDING, the duplicate request blocks until the original completes and returns the cached result."),
+        ("Safe Retry Semantics: ", "Clients may retry freely with the same Idempotency-Key; only the first execution touches the GPU."),
+        ("State Transitions: ", "PENDING is set atomically on first receipt. Transitions to COMPLETED (with cached response) or FAILED (allowing retry)."),
+        ("Fingerprint Validation: ", "If a key is reused with a different payload, the request is rejected with 422 Unprocessable Entity."),
+    ]:
+        bullet(doc, tx, bold_prefix=pf)
+
+    highlight_box(doc, "EXACTLY-ONCE GUARANTEE",
+        "No GPU cycle is wasted on duplicate work. The idempotency layer sits before the inference "
+        "queue, ensuring that retries due to network timeouts or client-side errors never result in "
+        "redundant GPU execution.", ACCENT_GREEN)
+
+    doc.add_page_break()
+
+    # ── 19. REQUEST SIZE & PAYLOAD LIMITS ──
+    section_header(doc, "19. REQUEST SIZE & PAYLOAD LIMITS")
+    body(doc,
+        "Strict payload validation protects GPU memory and prevents abuse. Every endpoint enforces "
+        "size limits at the API Gateway layer before requests reach the inference queue.")
+
+    subsection(doc, "Limit Configuration")
+    styled_table(doc,
+        ["Parameter", "Limit", "Enforcement Point", "Error Code"],
+        [
+            ["MAX_REQUEST_SIZE", "2 MB", "API Gateway (before routing)", "413 Payload Too Large"],
+            ["MAX_PROMPT_TOKENS", "4,096 tokens", "Tokenizer validation middleware", "422 Unprocessable Entity"],
+            ["MAX_BATCH_SIZE", "128 requests", "Dynamic Batcher admission", "429 Too Many Requests"],
+            ["MAX_STREAMING_WINDOW", "10 MB", "Streaming response accumulator", "413 Payload Too Large"],
+            ["MAX_CONTEXT_WINDOW", "8,192 tokens", "Model context length check", "422 Unprocessable Entity"],
+        ], widths=[1.8, 1.2, 2.2, 1.5])
+
+    subsection(doc, "GPU Memory Protection")
+    for pf, tx in [
+        ("Per-Endpoint Validation: ", "Each route defines its own payload schema with max sizes; rejected before queuing."),
+        ("Token Counting: ", "Tokenizer runs in the gateway to count prompt tokens before forwarding to the GPU."),
+        ("Batch Admission: ", "Batch requests exceeding MAX_BATCH_SIZE are split into sub-batches automatically."),
+        ("413 Handling: ", "Oversized payloads return 413 with Retry-After header and suggested chunking strategy."),
+        ("Memory Estimation: ", "Estimated KV cache memory is computed pre-flight; requests that would cause OOM are rejected early."),
+    ]:
+        bullet(doc, tx, bold_prefix=pf)
+
+    doc.add_page_break()
+
+    # ── 20. CIRCUIT BREAKING RULES ──
+    section_header(doc, "20. CIRCUIT BREAKING RULES")
+    body(doc,
+        "The CircuitBreakerOrchestrator manages 8 independent circuit breakers, each monitoring a "
+        "specific failure domain. When a breaker opens, traffic cascades through a structured "
+        "fallback chain to maintain service availability.")
+
+    subsection(doc, "Production Circuit Breaker Rules")
+    styled_table(doc,
+        ["Rule", "Trigger Condition", "Fallback Action", "Recovery"],
+        [
+            ["Triton Slow", "p95 > 300ms for 2 min", "Route to secondary region", "Half-open after 30s"],
+            ["5xx Rate", "> 5% error rate over 1 min", "Shed non-premium traffic", "Half-open after 45s"],
+            ["Redis Timeout", "> 100ms p99 for 3 min", "Switch to local cache", "Half-open after 20s"],
+            ["DynamoDB Slow", "Read latency > 50ms sustained", "Serve from Redis replica", "Half-open after 30s"],
+            ["GPU Queue Overflow", "Queue depth > 256", "Activate backpressure + shed best-effort", "Auto when depth < 128"],
+            ["Cross-Region Hedge", "Primary p50 > 100ms", "Race request to secondary region", "Continuous monitoring"],
+            ["KV Cache Pressure", "> 92% utilization", "Emergency eviction + batch shrink", "Auto when < 80%"],
+            ["Model Accuracy", "Drift > 2% from baseline", "Rollback to previous model version", "Manual verification"],
+        ], widths=[1.3, 1.8, 2.0, 1.5])
+
+    subsection(doc, "Fallback Chain")
+    for pf, tx in [
+        ("Level 1 (LLM): ", "Full LLM re-ranking with personalization context -- default path."),
+        ("Level 2 (Cached): ", "Serve cached LLM results from last successful inference (< 5 min old)."),
+        ("Level 3 (Embedding): ", "Embedding-only similarity ranking without LLM re-ranking."),
+        ("Level 4 (Popular): ", "Static popularity-based recommendations as last resort."),
+    ]:
+        bullet(doc, tx, bold_prefix=pf)
+
+    highlight_box(doc, "CIRCUIT BREAKER ORCHESTRATOR",
+        "The CircuitBreakerOrchestrator evaluates all 8 rules concurrently every 5 seconds. "
+        "If multiple breakers trip simultaneously, the most restrictive fallback takes precedence. "
+        "Each breaker maintains independent state and recovery timers.", ACCENT_ORANGE)
+
+    doc.add_page_break()
+
+    # ── 21. SLA/SLO/ERROR BUDGET FRAMEWORK ──
+    section_header(doc, "21. SLA/SLO/ERROR BUDGET FRAMEWORK")
+    body(doc,
+        "A rigorous three-tier reliability framework separates internal engineering targets (SLO) "
+        "from external customer commitments (SLA) with error budget policies that gate deployments "
+        "and trigger alerts.")
+
+    subsection(doc, "SLA vs SLO Targets")
+    styled_table(doc,
+        ["Metric", "Internal SLO", "External SLA", "Error Budget"],
+        [
+            ["Availability", "99.95%", "99.9%", "21.6 min/month (SLO basis)"],
+            ["p95 Latency", "< 180ms", "< 250ms", "5% of requests may exceed"],
+            ["p99 Latency", "< 250ms", "< 500ms", "1% of requests may exceed"],
+            ["Error Rate", "< 0.05%", "< 0.1%", "Based on rolling 30-day window"],
+            ["Data Freshness", "< 5 min", "< 15 min", "Measured via staleness metric"],
+        ], widths=[1.3, 1.3, 1.3, 2.3])
+
+    subsection(doc, "Error Budget Burn Rate Alerts")
+    styled_table(doc,
+        ["Alert Type", "Condition", "Window", "Action"],
+        [
+            ["Fast Burn", "> 2% budget consumed/hour", "1 hour", "Page on-call, freeze deploys"],
+            ["Slow Burn", "> 5% budget consumed/day", "24 hours", "Warn team, review changes"],
+            ["Budget Exhausted", "0% remaining", "30-day rolling", "EMERGENCY: all deploys frozen"],
+        ], widths=[1.3, 1.8, 1.2, 2.0])
+
+    subsection(doc, "Deployment Gates")
+    for pf, tx in [
+        ("ALLOW (> 50% budget): ", "Normal deployments permitted. Standard canary process applies."),
+        ("WARN (25-50% budget): ", "Deployments require explicit approval from on-call SRE."),
+        ("FREEZE (5-25% budget): ", "Only critical bug fixes and reliability improvements allowed."),
+        ("EMERGENCY (< 5% budget): ", "All deployments frozen. Incident response mode activated."),
+    ]:
+        bullet(doc, tx, bold_prefix=pf)
+
+    highlight_box(doc, "FINANCIAL PENALTY TIERS",
+        "SLA violations trigger tiered service credits: Tier 1 (99.9-99.5%) = 10% credit, "
+        "Tier 2 (99.5-99.0%) = 25% credit, Tier 3 (< 99.0%) = 50% credit. The 0.05% gap "
+        "between internal SLO (99.95%) and external SLA (99.9%) provides engineering margin.",
+        NETFLIX_RED)
+
+    doc.add_page_break()
+
+    # ── 22. GPU QUEUEING MODEL (MLFQ) ──
+    section_header(doc, "22. GPU QUEUEING MODEL (MLFQ)")
+    body(doc,
+        "The GPU inference queue uses a Multi-Level Feedback Queue (MLFQ) with 4 priority levels, "
+        "weighted round-robin scheduling, and starvation prevention to ensure fair GPU access "
+        "across request classes.")
+
+    subsection(doc, "Priority Levels")
+    styled_table(doc,
+        ["Priority", "Weight", "Max Wait", "Use Case", "Preemptible"],
+        [
+            ["P0 - CRITICAL", "8", "50ms", "Real-time inference, VIP users", "No"],
+            ["P1 - PREMIUM", "4", "100ms", "Paid tier, A/B test cohorts", "By P0 only"],
+            ["P2 - STANDARD", "2", "250ms", "Normal user requests", "By P0, P1"],
+            ["P3 - BEST_EFFORT", "1", "500ms", "Batch jobs, pre-computation", "By all higher"],
+        ], widths=[1.3, 0.7, 0.8, 2.0, 1.2])
+
+    subsection(doc, "Queue Configuration")
+    styled_table(doc,
+        ["Parameter", "Value", "Rationale"],
+        [
+            ["Max Queue Depth", "256 requests", "Beyond this, admission control rejects new requests"],
+            ["Weighted Round-Robin", "8:4:2:1 ratio", "CRITICAL gets 8x slots vs BEST_EFFORT per cycle"],
+            ["Starvation Prevention", "Promote after 500ms", "Requests waiting > 500ms move up one priority level"],
+            ["Preemption Policy", "Higher priority evicts lower", "Running BEST_EFFORT jobs yield GPU to CRITICAL"],
+            ["Admission Control", "GPU util > 95% blocks new", "Prevents queue explosion during saturation"],
+        ], widths=[1.5, 1.5, 3.2])
+
+    for pf, tx in [
+        ("Weighted Scheduling: ", "Each cycle allocates GPU slots proportionally: 8 CRITICAL, 4 PREMIUM, 2 STANDARD, 1 BEST_EFFORT."),
+        ("Anti-Starvation: ", "Any request waiting > 500ms is promoted one level, ensuring BEST_EFFORT requests eventually execute."),
+        ("Preemption: ", "A CRITICAL request can preempt a running BEST_EFFORT batch; the preempted request is re-queued at its original priority."),
+    ]:
+        bullet(doc, tx, bold_prefix=pf)
+
+    doc.add_page_break()
+
+    # ── 23. BACKPRESSURE HANDLING ──
+    section_header(doc, "23. BACKPRESSURE HANDLING")
+    body(doc,
+        "The backpressure system defines 4 pressure levels based on GPU queue depth, memory "
+        "utilization, and inference latency. Each level activates progressively aggressive "
+        "mitigation strategies to prevent system collapse.")
+
+    subsection(doc, "Pressure Levels")
+    styled_table(doc,
+        ["Level", "Trigger", "Batch Action", "Shedding Policy"],
+        [
+            ["NORMAL", "Queue < 64, GPU < 75%", "Full batch size (up to 128)", "None -- all traffic accepted"],
+            ["ELEVATED", "Queue 64-128 or GPU 75-85%", "Shrink batch to 75% of max", "Shed 10% of BEST_EFFORT"],
+            ["HIGH", "Queue 128-200 or GPU 85-92%", "Shrink batch to 50% of max", "Shed all BEST_EFFORT + 25% STANDARD"],
+            ["CRITICAL", "Queue > 200 or GPU > 92%", "Shrink batch to 25% of max", "Only CRITICAL + PREMIUM accepted"],
+        ], widths=[1.0, 1.8, 1.8, 2.0])
+
+    subsection(doc, "Mitigation Strategies")
+    for pf, tx in [
+        ("Adaptive Batch Shrink: ", "Batch size reduces proportionally to pressure level, freeing GPU memory for queued requests."),
+        ("Traffic Shedding: ", "Lower-priority traffic is shed first; CRITICAL requests are never shed regardless of pressure."),
+        ("Regional Rebalancing: ", "At HIGH/CRITICAL, Route53 weights shift traffic to less-loaded regions within 15 seconds."),
+        ("Graceful Degradation: ", "At CRITICAL, the system falls back to embedding-only mode (no LLM), reducing GPU load by 80%."),
+    ]:
+        bullet(doc, tx, bold_prefix=pf)
+
+    highlight_box(doc, "GRACEFUL DEGRADATION MATRIX",
+        "NORMAL: Full LLM re-ranking + personalization. ELEVATED: LLM with reduced context window. "
+        "HIGH: Cached LLM results + embedding fallback. CRITICAL: Embedding-only + popularity fallback. "
+        "Users always get recommendations; quality degrades gracefully under load.", ACCENT_BLUE)
+
+    doc.add_page_break()
+
+    # ── 24. ADAPTIVE DYNAMIC BATCHING ──
+    section_header(doc, "24. ADAPTIVE DYNAMIC BATCHING")
+    body(doc,
+        "The adaptive batching engine uses a feedback-driven control loop that continuously adjusts "
+        "batch size based on real-time GPU telemetry. Decisions (GROW, SHRINK, HOLD) are made every "
+        "evaluation interval using a multi-signal scoring function.")
+
+    subsection(doc, "Control Loop Signals")
+    styled_table(doc,
+        ["Signal", "Weight", "GROW Trigger", "SHRINK Trigger"],
+        [
+            ["GPU Utilization", "30%", "< 70% (underutilized)", "> 90% (saturated)"],
+            ["SM Occupancy", "25%", "< 60% (idle SMs)", "> 85% (contention)"],
+            ["p99 Latency", "25%", "< 200ms (headroom)", "> 350ms (SLO risk)"],
+            ["Error Rate", "20%", "< 0.1% (healthy)", "> 0.5% (degraded)"],
+        ], widths=[1.3, 0.8, 2.0, 2.0])
+
+    subsection(doc, "Batching Parameters")
+    styled_table(doc,
+        ["Parameter", "Value", "Description"],
+        [
+            ["Batch Bounds", "[1, 128]", "Minimum and maximum batch size limits"],
+            ["Growth Factor", "1.25x", "Batch grows by 25% on GROW decision"],
+            ["Shrink Factor", "0.75x", "Batch shrinks by 25% on SHRINK decision"],
+            ["Evaluation Interval", "5 seconds", "Control loop runs every 5 seconds"],
+            ["Stability Window", "3 consecutive signals", "Must see 3 consistent signals before acting"],
+        ], widths=[1.5, 1.0, 3.7])
+
+    for pf, tx in [
+        ("GROW Decision: ", "Weighted score > +0.3 (GPU underutilized, latency within SLO, low errors). Batch size *= 1.25."),
+        ("SHRINK Decision: ", "Weighted score < -0.3 (GPU saturated, latency spiking, errors rising). Batch size *= 0.75."),
+        ("HOLD Decision: ", "Score between -0.3 and +0.3 (system in equilibrium). No change to batch size."),
+        ("Auto-Tuning: ", "Growth/shrink factors self-adjust based on historical effectiveness of past decisions."),
+    ]:
+        bullet(doc, tx, bold_prefix=pf)
+
+    doc.add_page_break()
+
+    # ── 25. CANARY DEPLOYMENT ENGINE ──
+    section_header(doc, "25. CANARY DEPLOYMENT ENGINE")
+    body(doc,
+        "The canary deployment engine implements progressive traffic shifting with automated "
+        "health comparison and rollback. Each stage has a bake time and must pass all safety "
+        "thresholds before advancing.")
+
+    subsection(doc, "Progressive Rollout Stages")
+    styled_table(doc,
+        ["Stage", "Traffic %", "Bake Time", "Rollback Criteria"],
+        [
+            ["Stage 1", "5%", "5 minutes", "Any metric exceeds threshold"],
+            ["Stage 2", "10%", "10 minutes", "p95 latency > 10% degradation"],
+            ["Stage 3", "25%", "15 minutes", "Error rate > 1% above baseline"],
+            ["Stage 4", "50%", "15 minutes", "Accuracy drift > 2% from baseline"],
+            ["Stage 5", "75%", "10 minutes", "GPU utilization anomaly > 15%"],
+            ["Stage 6", "100%", "30 minutes (final bake)", "Post-deploy validation suite"],
+        ], widths=[0.8, 0.9, 1.3, 3.2])
+
+    subsection(doc, "Auto-Rollback Thresholds")
+    styled_table(doc,
+        ["Metric", "Threshold", "Comparison Basis", "Action"],
+        [
+            ["p95 Latency", "> 10% increase", "Canary vs baseline (control)", "Immediate rollback"],
+            ["Error Rate", "> 1% absolute increase", "5xx responses canary vs control", "Immediate rollback"],
+            ["Model Accuracy", "> 2% degradation", "A/B accuracy scoring", "Pause + alert, manual decision"],
+            ["GPU Memory", "> 5% higher usage", "Canary GPU memory vs baseline", "Pause + investigate"],
+        ], widths=[1.2, 1.3, 2.0, 1.7])
+
+    for pf, tx in [
+        ("Health Comparison: ", "Canary metrics are compared against a statistically equivalent control group at each stage."),
+        ("Bake Time: ", "Minimum observation period per stage ensures transient effects do not mask regressions."),
+        ("Automated Rollback: ", "If any threshold is breached, traffic instantly reverts to the previous stable version."),
+        ("Multi-Region: ", "Canary rolls out to us-east-1 first; only after full bake does it propagate to other regions."),
+    ]:
+        bullet(doc, tx, bold_prefix=pf)
+
+    doc.add_page_break()
+
+    # ── 26. FAILURE SCENARIO SIMULATION ──
+    section_header(doc, "26. FAILURE SCENARIO SIMULATION")
+    body(doc,
+        "The platform is hardened against 13 production failure scenarios, each with defined "
+        "triggers, automated detection, mitigation runbooks, and MTTR targets. These scenarios "
+        "are validated through regular chaos engineering exercises.")
+
+    subsection(doc, "GPU & Hardware Failures")
+    styled_table(doc,
+        ["Scenario", "Detection", "Mitigation", "MTTR Target"],
+        [
+            ["GPU OOM", "DCGM memory alert > 98%", "Emergency KV cache eviction + batch shrink", "< 10 seconds"],
+            ["Thermal Throttle", "GPU temp > 83C sustained", "Reduce batch size + shift traffic to cooler node", "< 30 seconds"],
+            ["ECC Error", "DCGM ECC counter increment", "Drain node, migrate workloads, schedule replacement", "< 5 minutes"],
+            ["NVLink Failure", "NVLink bandwidth drop > 50%", "Reconfigure TP groups excluding failed link", "< 2 minutes"],
+        ], widths=[1.2, 1.6, 2.4, 1.0])
+
+    subsection(doc, "Software & Infrastructure Failures")
+    styled_table(doc,
+        ["Scenario", "Detection", "Mitigation", "MTTR Target"],
+        [
+            ["KV Cache Overflow", "Cache utilization > 95%", "Aggressive LRU eviction + defragmentation", "< 15 seconds"],
+            ["Triton Crash", "Health check failure x3", "Restart container + warm from snapshot", "< 30 seconds"],
+            ["Redis Partition", "Cluster slot coverage < 100%", "Failover to replica + local cache mode", "< 20 seconds"],
+            ["Region Failure", "Route53 health check fail", "DNS failover to surviving regions", "< 15 seconds"],
+            ["Cascading Timeout", "Timeout propagation detected", "Circuit breaker opens + load shedding", "< 10 seconds"],
+        ], widths=[1.2, 1.6, 2.4, 1.0])
+
+    subsection(doc, "Traffic & Model Failures")
+    styled_table(doc,
+        ["Scenario", "Detection", "Mitigation", "MTTR Target"],
+        [
+            ["3x Traffic Spike", "RPS > 300% of baseline", "Autoscale + backpressure + regional rebalance", "< 2 minutes"],
+            ["Model Corruption", "Accuracy drop > 5%", "Auto-rollback to last known good version", "< 1 minute"],
+            ["Cold Start Storm", "> 5 nodes starting simultaneously", "Staggered warm-up + warm pool activation", "< 3 minutes"],
+            ["DNS Failure", "Resolution timeout > 5s", "Cached DNS entries + direct IP fallback", "< 30 seconds"],
+        ], widths=[1.2, 1.6, 2.4, 1.0])
+
+    highlight_box(doc, "CHAOS ENGINEERING",
+        "All 13 scenarios are tested quarterly via automated chaos experiments. Each scenario has a "
+        "runbook, an automated detection mechanism, and a verified mitigation path. Mean MTTR across "
+        "all scenarios: 47 seconds.", ACCENT_PURPLE)
+
     doc.add_paragraph()
 
     # Final quote box
