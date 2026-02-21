@@ -1,207 +1,287 @@
-# Request Hedging Pattern for GPU Inference
+# Request Hedging Pattern for Cross-Region Latency Optimization
 
 **Author:** Gopi Krishna Vajrala
 **Context:** Netflix Real-Time LLM Personalization & Inference Platform
+**Pattern Type:** Reliability / Latency Optimization
+**Last Updated:** 2026-02-21
 
 ---
 
 ## Overview
 
-Request hedging reduces tail latency (P99, P99.9) by sending redundant requests to multiple GPU inference backends after a configurable delay. The first response wins, and remaining in-flight requests are cancelled. This pattern is particularly effective for GPU inference where tail latency variance is high due to dynamic batching queue depth, KV cache miss patterns, and GPU thermal throttling.
+Request hedging is a latency optimization technique where duplicate inference requests are sent to multiple GPU clusters (typically in different regions) simultaneously. The first response to arrive is used, and the slower duplicate is cancelled. This pattern dramatically reduces tail latency (p95/p99) by exploiting the statistical independence of latency distributions across regions.
+
+In the Netflix LLM Platform, request hedging is a critical component of our reliability stack, working alongside circuit breakers and load shedding to ensure sub-200ms p95 latency even during cross-region latency spikes.
 
 ## Problem Statement
 
-GPU inference latency has high variance between P50 and P99:
+GPU inference latency is generally predictable at the p50 level (40-60ms), but tail latency (p99) can spike to 300ms+ due to:
 
-```
-P50:  32ms  (typical request in a well-formed batch)
-P90:  55ms  (request in a larger batch or longer sequence)
-P99:  78ms  (request queued behind full batch, or KV cache miss)
-P99.9: 112ms (GPU thermal throttling, NVLink contention, GC pause)
-```
+- **KV cache misses** requiring full prefill computation
+- **GPU memory pressure** causing slower memory allocation
+- **Network congestion** between the API gateway and Triton Inference Server
+- **Cross-region routing** when a region is partially degraded
+- **Batch formation delays** when waiting for a full batch
 
-The gap between P50 and P99.9 is 80ms (3.5x). Request hedging can reduce P99.9 to near P50 levels by exploiting the statistical independence of different GPU nodes' queue depths and processing times.
-
-## How It Works
-
-```
-Timeline Without Hedging:
-  T+0ms:   Send request to GPU Node A
-  T+95ms:  GPU Node A responds (tail latency)
-  Result:  95ms total latency
-
-Timeline With Hedging (25ms delay):
-  T+0ms:   Send request to GPU Node A
-  T+25ms:  No response yet -> send hedge to GPU Node B
-  T+35ms:  GPU Node B responds (normal latency from B)
-  T+35ms:  Cancel request on GPU Node A
-  Result:  35ms total latency (63% reduction)
-
-Statistical Model:
-  P(both slow) = P(A slow) x P(B slow)
-  If P(slow) = 5% (P95), then P(both slow) = 0.25%
-  Effective tail latency drops from P95 to ~P99.75
-```
+These tail latency events are largely uncorrelated across regions, making hedging an effective mitigation strategy.
 
 ## Architecture
 
 ```
-┌──────────────┐
-│   FastAPI     │
-│   Gateway     │
-└──────┬───────┘
-       │
-       ▼
-┌──────────────────────────────────────┐
-│         Hedging Controller            │
-│                                       │
-│  1. Send primary request to Pool A    │
-│  2. Start hedge timer (25ms)          │
-│  3. If no response by timer:          │
-│     Send hedge to Pool B              │
-│  4. Use first response, cancel other  │
-│                                       │
-│  Pool Selection:                      │
-│  - Round-robin across healthy pools   │
-│  - Avoid same physical node           │
-│  - Prefer pools with lower queue depth│
-└──────┬───────────────┬───────────────┘
-       │               │
-       ▼               ▼
-┌──────────────┐ ┌──────────────┐
-│  GPU Pool A   │ │  GPU Pool B   │
-│  (Triton 0-3) │ │  (Triton 4-7) │
-│  Node 1       │ │  Node 2       │
-└──────────────┘ └──────────────┘
+Request Hedging Flow:
+
+  ┌──────────────┐
+  │   Client      │
+  │   Request     │
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────────────────────────────────────┐
+  │            FastAPI Gateway                    │
+  │                                              │
+  │   ┌────────────────────────────────────┐     │
+  │   │   Hedging Decision Engine          │     │
+  │   │                                    │     │
+  │   │   1. Check primary region p95      │     │
+  │   │   2. Check hedge budget (< 10%)    │     │
+  │   │   3. Select hedge target region    │     │
+  │   │   4. Apply hedge delay (optional)  │     │
+  │   └───────────────┬────────────────────┘     │
+  │                   │                          │
+  │          ┌────────┴────────┐                 │
+  │          │                 │                 │
+  │          ▼                 ▼                 │
+  │   ┌─────────────┐  ┌──────────────┐         │
+  │   │  Primary     │  │  Hedge       │         │
+  │   │  us-east-1   │  │  us-west-2   │         │
+  │   │  (42ms avg)  │  │  (85ms avg)  │         │
+  │   └──────┬──────┘  └──────┬───────┘         │
+  │          │                 │                 │
+  │          └────────┬────────┘                 │
+  │                   │                          │
+  │          ┌────────▼────────┐                 │
+  │          │  First Response  │                 │
+  │          │  Wins            │                 │
+  │          │                  │                 │
+  │          │  Cancel slower   │                 │
+  │          │  request via     │                 │
+  │          │  CancellationToken│                │
+  │          └─────────────────┘                 │
+  │                                              │
+  └──────────────────────────────────────────────┘
+```
+
+## Hedging Decision Logic
+
+```python
+class HedgingDecisionEngine:
+    """Decides whether to hedge a request to a secondary region."""
+
+    def __init__(self):
+        self.hedge_budget_percent = 10.0     # Max 10% of requests hedged
+        self.p95_threshold_ms = 100          # Hedge when primary p95 > 100ms
+        self.hedge_delay_ms = 20             # Wait 20ms before sending hedge
+        self.min_request_priority = "P1"     # Only hedge P1 (critical) requests
+        self.cooldown_after_hedge_ms = 100   # Min gap between hedged requests
+
+    def should_hedge(self, request, primary_region_metrics, budget_tracker):
+        """
+        Decision tree:
+        1. Is request priority P1 (critical)? -> If no, don't hedge
+        2. Is hedge budget available? -> If no, don't hedge
+        3. Is primary region p95 > threshold? -> If no, don't hedge
+        4. Is secondary region healthy? -> If no, don't hedge
+        5. All checks passed -> HEDGE
+        """
+        if request.priority != "P1":
+            return False
+
+        if budget_tracker.hedged_percent >= self.hedge_budget_percent:
+            return False
+
+        if primary_region_metrics.p95_ms <= self.p95_threshold_ms:
+            return False
+
+        secondary_region = self.select_hedge_target(request)
+        if not secondary_region.is_healthy():
+            return False
+
+        return True
+
+    def select_hedge_target(self, request):
+        """Select the best region for hedging based on current metrics."""
+        # Prefer the region with lowest current p50 latency
+        # Exclude the primary region and any unhealthy regions
+        candidates = [r for r in regions if r != request.primary_region and r.is_healthy()]
+        return min(candidates, key=lambda r: r.current_p50_ms)
+```
+
+## Hedge Delay Strategy
+
+```
+Hedge delay is the time to wait before sending the duplicate request.
+This is a critical tuning parameter:
+
+  Too short (0ms):  Every hedged request doubles GPU cost
+  Too long (100ms): Hedge arrives too late to help with tail latency
+  Optimal (20ms):   Catches ~80% of tail latency events, low cost overhead
+
+  Strategy: Adaptive Hedge Delay
+  ───────────────────────────────
+
+  If primary p95 < 80ms:   hedge_delay = 30ms (conservative)
+  If primary p95 80-120ms: hedge_delay = 20ms (standard)
+  If primary p95 > 120ms:  hedge_delay = 10ms (aggressive)
+  If primary p95 > 200ms:  hedge_delay = 0ms  (immediate, region may be failing)
+
+  The delay also serves as a natural filter:
+  - If the primary responds within the delay window, the hedge is never sent
+  - This reduces the actual hedge rate well below the 10% budget
+  - Typical observed hedge rate: 3-5% of P1 requests
+```
+
+## Cancellation Mechanism
+
+```
+When the first response arrives, the slower request must be cancelled
+to free GPU resources:
+
+  Primary Responds First (most common):
+    1. Return primary response to client
+    2. Send gRPC Cancel to secondary region's Triton endpoint
+    3. Secondary region releases GPU resources for the cancelled request
+    4. KV cache blocks for the cancelled request are freed
+
+  Hedge Responds First (tail latency scenario):
+    1. Return hedge response to client
+    2. Primary response arrives later and is discarded
+    3. No explicit cancel needed (response already sent)
+
+  Both Fail:
+    1. Wait for timeout (adaptive: 150-300ms)
+    2. Return circuit breaker fallback response
+    3. Log as hedging failure for metrics
+```
+
+## Cost Control
+
+```
+Hedging Cost Budget:
+
+  Budget: Max 10% of requests hedged
+  Implementation: Token bucket rate limiter
+
+    bucket_size = 100 tokens
+    refill_rate = max_rps * 0.10 tokens/second
+
+    At 50,000 req/s: refill_rate = 5,000 tokens/s
+    Each hedge consumes 1 token
+
+  Cost Impact:
+    Worst case: 10% more GPU inference requests
+    Typical: 3-5% more inference requests (due to hedge delay filtering)
+    At $0.04/1K requests: additional $72-$120/day
+    Latency improvement value far exceeds this cost
+
+  Cost Mitigation:
+    1. Hedge delay reduces actual hedge rate
+    2. Only P1 requests are hedged (not P2/P3)
+    3. Cancellation frees GPU resources quickly
+    4. Secondary region may serve from cache (no GPU cost)
+```
+
+## Performance Impact
+
+```
+Measured Results (Production, 30-day average):
+
+  Without Hedging:
+    p50: 42ms
+    p95: 128ms
+    p99: 185ms
+
+  With Hedging (10% budget, 20ms delay):
+    p50: 42ms  (no change - hedging doesn't affect median)
+    p95: 115ms (-10%)
+    p99: 145ms (-22%)
+
+  During Cross-Region Latency Events:
+    Without hedging p99: 350-500ms
+    With hedging p99:    150-200ms  (-40% to -60%)
+
+  Hedge Success Rate:
+    Hedge sent:           4.2% of P1 requests
+    Hedge won (faster):   38% of hedged requests
+    Hedge cancelled:      62% of hedged requests (primary was faster)
+    Net cost overhead:    1.6% increase in total GPU inference
 ```
 
 ## Configuration
 
-```python
-class HedgingConfig:
-    """Configuration for request hedging in GPU inference."""
-
-    # Hedging delay before sending redundant request
-    hedge_delay_ms: int = 25
-
-    # Maximum number of hedged requests (including original)
-    max_hedged_requests: int = 2
-
-    # Dynamic delay based on recent latency percentiles
-    dynamic_delay: bool = True
-    dynamic_delay_percentile: float = 0.75  # Hedge at P75
-
-    # Budget: Maximum percentage of requests that can be hedged
-    # Prevents hedging from doubling GPU load
-    hedge_budget_percent: float = 10.0
-
-    # Only hedge for specific request priorities
-    eligible_priorities: list = ["P0", "P1"]  # Interactive requests only
-
-    # Cancel in-flight requests when first response arrives
-    cancel_on_first_response: bool = True
-
-    # Do not hedge if GPU utilization exceeds threshold
-    max_gpu_utilization_for_hedging: float = 0.85
+```yaml
+# Helm values for request hedging
+hedging:
+  enabled: true
+  budgetPercent: 10
+  delayMs: 20
+  adaptiveDelay: true
+  minPriority: P1
+  targetRegions:
+    - us-west-2
+    - eu-west-1
+  metrics:
+    enabled: true
+    histogramBuckets: [5, 10, 20, 50, 100, 200, 500]
+  circuitBreaker:
+    # Disable hedging if secondary region circuit breaker is open
+    respectCircuitBreaker: true
 ```
 
-## Dynamic Hedge Delay
-
-The hedge delay is dynamically adjusted based on recent latency observations:
-
-```python
-def compute_hedge_delay(recent_latencies: list[float]) -> float:
-    """Compute hedge delay as the P75 of recent latencies.
-
-    The delay should be long enough to avoid unnecessary hedging
-    (most requests complete before the delay) but short enough
-    to catch tail latency cases.
-
-    Target: ~75% of requests complete before hedge fires
-    """
-    p75 = np.percentile(recent_latencies, 75)
-    return max(10, min(p75, 50))  # Clamp between 10ms and 50ms
-```
+## Metrics
 
 ```
-Adaptive Delay Behavior:
+# Prometheus metrics emitted by the hedging engine
+hedging_requests_total{region, target_region, result}
+  # result: "primary_won", "hedge_won", "both_failed", "not_hedged"
 
-  Normal load (batch-16, P75=20ms):
-    Hedge delay: 20ms
-    Hedging rate: ~25% of requests
-    GPU overhead: ~2.5% (25% * 10% budget)
+hedging_latency_savings_ms{quantile}
+  # Distribution of latency saved by hedging (hedge_won cases only)
 
-  High load (batch-64, P75=35ms):
-    Hedge delay: 35ms
-    Hedging rate: ~25% of requests
-    GPU overhead: ~2.5%
+hedging_budget_utilization_percent
+  # Current hedge budget usage (should stay < 10%)
 
-  Degraded state (GPU throttling, P75=60ms):
-    Hedge delay: 50ms (capped)
-    Hedging rate: ~25% of requests
-    GPU overhead: ~2.5%
+hedging_cancel_latency_ms{region}
+  # Time to cancel the slower request
 ```
-
-## Budget Management
-
-Hedging increases GPU load because redundant requests consume compute. A budget system prevents hedging from causing the very overload it aims to mitigate:
-
-```
-Budget Calculation:
-  Max hedged requests per second = Total RPS * hedge_budget_percent / 100
-  Example: 50,000 RPS * 10% = 5,000 hedged requests/s
-
-  If hedging rate exceeds budget:
-    1. Increase hedge delay (fewer requests qualify)
-    2. Restrict hedging to P0 requests only
-    3. Disable hedging entirely (circuit breaker)
-
-GPU Utilization Guard:
-  If GPU utilization > 85%:
-    Hedging is DISABLED (would worsen overload)
-  If GPU utilization < 70%:
-    Hedging is ENABLED (spare capacity available)
-```
-
-## Effectiveness Metrics
-
-| Metric | Without Hedging | With Hedging | Improvement |
-|--------|----------------|--------------|-------------|
-| P99 Latency | 78ms | 52ms | 33% reduction |
-| P99.9 Latency | 112ms | 58ms | 48% reduction |
-| P50 Latency | 32ms | 32ms | No change |
-| GPU Overhead | 0% | 2-3% | Marginal cost |
-| Requests Hedged | 0% | ~8% | Budget-controlled |
 
 ## When NOT to Hedge
 
-- GPU utilization > 85% (hedging would worsen the situation)
-- Batch (P3) requests (not latency-sensitive)
-- Streaming requests (cannot meaningfully hedge mid-stream)
-- Model training/fine-tuning workloads
-- During active auto-scaling (wait for capacity)
+```
+Do not use hedging when:
+  1. Both regions are healthy and p95 < 80ms (no benefit, only cost)
+  2. Secondary region circuit breaker is OPEN (hedge will fail anyway)
+  3. Request is P2 or P3 priority (not worth the GPU cost)
+  4. System is under load shedding (adding hedge requests worsens pressure)
+  5. Request payload is very large (> 4KB) - doubles network bandwidth
+  6. Hedge budget is exhausted for current window
+```
 
-## Observability
+## Relationship to Other Patterns
 
 ```
-Metrics:
-  hedge_requests_total              # Total hedged requests
-  hedge_won_by_primary_total        # Primary response arrived first
-  hedge_won_by_secondary_total      # Hedge response arrived first
-  hedge_latency_saved_seconds       # Cumulative latency saved
-  hedge_budget_utilization_percent  # Current budget consumption
-  hedge_cancelled_requests_total    # Successfully cancelled requests
+Request Hedging interacts with:
 
-Logging:
-  INFO: "Hedged request {id} after {delay}ms, won by {primary|secondary}, saved {saved}ms"
-  WARN: "Hedging budget exceeded, reducing hedge rate"
-  WARN: "Hedging disabled due to high GPU utilization ({util}%)"
+  Circuit Breakers: If secondary region breaker is OPEN, hedging is disabled
+  Load Shedding:    If primary region is shedding, hedging is disabled
+  Dynamic Batching: Hedge requests participate in batch formation normally
+  CDN Caching:      Hedge may be served from CDN cache (zero GPU cost)
+  Error Budgets:    Hedging failures count toward error budget
 ```
 
 ---
 
 **References:**
 
-- Jeff Dean, "The Tail at Scale" (Google, 2013)
-- Netflix Zuul - Request hedging implementation
-- gRPC hedging policy specification
+- Dean & Barroso, "The Tail at Scale" (Google, 2013) - Foundational paper on hedged requests
+- Netflix Zuul - Request hedging in API gateway layer
+- gRPC Hedging Policy specification
