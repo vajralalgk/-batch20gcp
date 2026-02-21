@@ -300,6 +300,15 @@ def create_document():
         ("15.", "Business Impact & ROI"),
         ("16.", "Technology Roadmap"),
         ("17.", "Team & Skills Demonstrated"),
+        ("18.", "Idempotency & Request Safety"),
+        ("19.", "Request Size & Payload Limits"),
+        ("20.", "Circuit Breaking Rules"),
+        ("21.", "SLA/SLO/Error Budget Framework"),
+        ("22.", "GPU Queueing Model (MLFQ)"),
+        ("23.", "Backpressure Handling"),
+        ("24.", "Adaptive Dynamic Batching"),
+        ("25.", "Canary Deployment Engine"),
+        ("26.", "Failure Scenario Simulation"),
     ]
     for num, title in toc:
         p = doc.add_paragraph()
