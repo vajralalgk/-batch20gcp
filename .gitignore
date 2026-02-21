@@ -1,69 +1,314 @@
-# ============================================================================
-# Enterprise Cloud Transformation Platform (ECTP) - Git Ignore
+# =============================================================================
+# Netflix Real-Time LLM Personalization & Inference Platform - Git Ignore
 # Author: Gopi Krishna Vajrala
-# ============================================================================
+# =============================================================================
+# Covers: Python, ML/AI, Terraform, Docker, IDE, macOS, Linux
+# =============================================================================
 
-# --- Environment & Secrets ---
-.env
-.env.local
-.env.production
-*.pem
-*.key
-*.crt
-credentials.json
-secrets.yaml
-
-# --- Python ---
+# =============================================================================
+# Python
+# =============================================================================
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 *.egg-info/
+*.egg
 dist/
 build/
 eggs/
-*.egg
-.pytest_cache/
-.mypy_cache/
-.coverage
+*.whl
+pip-wheel-metadata/
+*.manifest
+*.spec
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.env.local
+.env.development
+.env.staging
+.env.production
+
+# Distribution / packaging
+develop-eggs/
+sdist/
+wheels/
+share/python-wheels/
+
+# PyInstaller
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage
 htmlcov/
 .tox/
-venv/
-.venv/
+.nox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+nosetests.xml
+coverage.xml
+junit*.xml
+*.cover
+*.py,cover
+.hypothesis/
 
-# --- Terraform ---
-.terraform/
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pytype/
+.pyre/
+
+# Profiling
+*.prof
+*.lprof
+
+# =============================================================================
+# Machine Learning / AI
+# =============================================================================
+# Model files (large binary files)
+*.pt
+*.pth
+*.onnx
+*.plan
+*.engine
+*.trt
+*.bin
+*.safetensors
+*.gguf
+*.ggml
+*.h5
+*.hdf5
+*.pb
+*.tflite
+*.mlmodel
+
+# Model directories
+model_repository/
+models/
+checkpoints/
+saved_models/
+pretrained/
+finetuned/
+
+# Dataset files
+*.csv
+*.parquet
+*.arrow
+*.feather
+data/raw/
+data/processed/
+data/interim/
+datasets/
+
+# Training artifacts
+runs/
+logs/
+tensorboard/
+wandb/
+mlruns/
+*.tfevents.*
+
+# Tokenizer caches
+tokenizer_cache/
+hf_cache/
+.cache/huggingface/
+
+# NVIDIA / CUDA
+*.cubin
+*.fatbin
+*.ptx
+*.gpu
+cuda_profile_*.csv
+nsight_*.nsys-rep
+nsight_*.ncu-rep
+*.qdrep
+*.sqlite
+
+# Benchmark results (keep reports, not raw data)
+benchmark_results/
+*.benchmark.json
+throughput_results.json
+latency_results.json
+gpu_results.json
+benchmark_consolidated.json
+
+# =============================================================================
+# Terraform
+# =============================================================================
+# Terraform state files
 *.tfstate
 *.tfstate.*
-*.tfvars
-!*.tfvars.example
-crash.log
-override.tf
-override.tf.json
-*_override.tf
-*_override.tf.json
-.terraformrc
-terraform.rc
+*.tfstate.backup
 
-# --- IDE ---
-.idea/
+# Terraform directory
+.terraform/
+.terraform.lock.hcl
+
+# Crash log files
+crash.log
+crash.*.log
+
+# Terraform variable files (may contain secrets)
+*.tfvars
+!example.tfvars
+!terraform.tfvars.example
+
+# Terraform plan files
+*.tfplan
+*.plan
+
+# =============================================================================
+# Docker
+# =============================================================================
+# Docker Compose override
+docker-compose.override.yml
+docker-compose.local.yml
+
+# =============================================================================
+# Environment & Secrets
+# =============================================================================
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Credentials and keys
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+*.jks
+credentials.json
+service-account.json
+*-credentials.json
+*-keyfile.json
+
+# AWS
+.aws/
+aws-credentials
+
+# Kubernetes
+kubeconfig
+*.kubeconfig
+
+# =============================================================================
+# IDE / Editor
+# =============================================================================
+# VS Code
 .vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# JetBrains (PyCharm, IntelliJ)
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# Vim
 *.swp
 *.swo
+*.swn
 *~
+.netrwhist
+tags
+
+# Emacs
+*~
+\#*\#
+.\#*
+*.elc
+
+# Sublime Text
+*.sublime-workspace
+*.sublime-project
+
+# =============================================================================
+# Operating System
+# =============================================================================
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+Icon?
 
-# --- Node (build tools) ---
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# =============================================================================
+# Build / Package
+# =============================================================================
 node_modules/
-package-lock.json
+*.lock
+!poetry.lock
+!Pipfile.lock
 
-# --- Docker ---
-docker-compose.override.yml
-
-# --- Logs ---
+# =============================================================================
+# Logs
+# =============================================================================
 *.log
 logs/
+log/
 
-# --- OS ---
-Thumbs.db
-.DS_Store
+# =============================================================================
+# Misc
+# =============================================================================
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.orig
+*.backup
+
+# Archives
+*.tar.gz
+*.tgz
+*.zip
+*.rar
+*.7z
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Documentation build
+docs/_build/
+site/
+
+# Security scan reports (generated, not source)
+bandit-report.json
+pip-audit-report.json
+safety-report.json
+trivy-results.sarif
+gitleaks-report.json
